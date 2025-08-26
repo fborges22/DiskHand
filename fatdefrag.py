@@ -412,38 +412,68 @@ class FatVolume:
             for i in range(0, len(sec), 32):
                 e = sec[i:i+32]
                 raw_off = off + i
+
                 name0 = e[0]
                 if name0 == 0x00:
+                    # end of directory
+                    lfn_stack.clear()
                     return
                 if name0 == 0xE5:
-                    lfn_stack.clear(); continue
+                    # deleted entry; discard any pending LFN
+                    lfn_stack.clear()
+                    continue
+
                 attr = e[11]
                 if attr == ATTR_LFN:
-                    lfn_stack.append(e); continue
-                if attr & ATTR_VOLUME_ID:
-                    lfn_stack.clear(); continue
+                    # long file name component
+                    lfn_stack.append(e)
+                    continue
+
                 is_dir = bool(attr & ATTR_DIRECTORY)
-                start_lo = struct.unpack_from("<H", e, 26)[0]
-                start_hi = struct.unpack_from("<H", e, 20)[0] if self.bpb.fat_type == "FAT32" else 0
-                start = (start_hi << 16) | start_lo
-                size = struct.unpack_from("<I", e, 28)[0]
+
+                # Build display name (prefer LFN if we have it)
                 if lfn_stack:
-                    name = self._lfn_to_name(reversed(lfn_stack)); lfn_stack.clear()
+                    name = self._lfn_to_name(reversed(lfn_stack))
+                    lfn_stack.clear()
                 else:
                     base = e[0:8].decode('ascii', errors='replace').rstrip()
-                    ext = e[8:11].decode('ascii', errors='replace').rstrip()
+                    ext  = e[8:11].decode('ascii', errors='replace').rstrip()
                     name = f"{base}.{ext}".rstrip('.')
-                entries.append(DirEntry(name=name, attr=attr, start_cluster=start,
-                                        size=size, is_dir=is_dir, raw_offset=raw_off))
 
-        if self.bpb.fat_type == "FAT16":
+                # Skip volume labels; skip dot entries
+                if attr & ATTR_VOLUME_ID:
+                    continue
+                if is_dir and name in (".", ".."):
+                    lfn_stack.clear()
+                    continue
+
+                start_lo = struct.unpack_from("<H", e, 26)[0]
+                start_hi = struct.unpack_from("<H", e, 20)[0] if self.bpb.fat_type == "FAT32" else 0
+                start    = (start_hi << 16) | start_lo
+                size     = struct.unpack_from("<I", e, 28)[0]
+
+                entries.append(DirEntry(
+                    name=name,
+                    attr=attr,
+                    start_cluster=start,
+                    size=size,
+                    is_dir=is_dir,
+                    raw_offset=raw_off
+                ))
+
+        # Walk the directory sectors and parse each one
+        if self.bpb.fat_type == "FAT16" and (start_cluster is None or start_cluster < 2):
+            # FAT16 root directory lives in a fixed area
             for off, sec in self.iter_root_dir_sectors():
                 parse_sector(off, sec)
         else:
-            if start_cluster is None:
-                start_cluster = self.bpb.root_clus
+            # Subdirectory (FAT16) or any directory (FAT32) via cluster chain
+            if start_cluster is None or start_cluster < 2:
+                # Defensive: FAT32 root should have a valid cluster; if not, return empty
+                return entries
             for off, sec in self.iter_dir_chain(start_cluster):
                 parse_sector(off, sec)
+
         return entries
 
     @staticmethod
