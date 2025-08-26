@@ -403,9 +403,13 @@ class FatVolume:
                 off = (first_sec + i) * size
                 yield off, read_at(self.f, off, size)
 
-    def list_directory(self, start_cluster: Optional[int], base_offset: Optional[int]=None) -> List[DirEntry]:
-        entries: List[DirEntry] = []
-        lfn_stack: List[bytes] = []
+    def list_directory(self, start_cluster: Optional[int], base_offset: Optional[int] = None):
+        ATTR_LFN       = 0x0F
+        ATTR_DIRECTORY = 0x10
+        ATTR_VOLUME_ID = 0x08
+
+        entries: list[DirEntry] = []
+        lfn_stack: list[bytes] = []
 
         def parse_sector(off: int, sec: bytes):
             nonlocal entries, lfn_stack
@@ -431,20 +435,20 @@ class FatVolume:
 
                 is_dir = bool(attr & ATTR_DIRECTORY)
 
-                # Build display name (prefer LFN if we have it)
+                # Build display name
                 if lfn_stack:
                     name = self._lfn_to_name(reversed(lfn_stack))
                     lfn_stack.clear()
                 else:
-                    base = e[0:8].decode('ascii', errors='replace').rstrip()
-                    ext  = e[8:11].decode('ascii', errors='replace').rstrip()
-                    name = f"{base}.{ext}".rstrip('.')
+                    base = e[0:8].decode("ascii", errors="replace").rstrip()
+                    ext  = e[8:11].decode("ascii", errors="replace").rstrip()
+                    name = f"{base}.{ext}".rstrip(".")
+                name = name.strip().strip("/\\")  # never carry trailing slashes
 
-                # Skip volume labels; skip dot entries
+                # Skip volume labels and dot entries
                 if attr & ATTR_VOLUME_ID:
                     continue
                 if is_dir and name in (".", ".."):
-                    lfn_stack.clear()
                     continue
 
                 start_lo = struct.unpack_from("<H", e, 26)[0]
@@ -519,6 +523,110 @@ class IntegrityChecker:
         self.strict = strict
         self.verbose = verbose
         self.cluster_size = vol.sec_per_clus * vol.byts_per_sec
+
+    def _canon_dir(self, p: str) -> str:
+        """Canonical directory label for ownership comparisons."""
+        return p.rstrip("/\\") + "/"
+
+    def _cluster_chain_upto(self, start: int, max_len: int):
+        """
+        Return up to `max_len` clusters from the chain starting at `start`.
+        Also returns (truncated, looped) flags.
+        """
+        chain = []
+        seen = set()
+        n = start
+        looped = False
+        while n is not None and len(chain) < max_len:
+            if n in seen:
+                looped = True
+                break
+            seen.add(n)
+            chain.append(n)
+            n = self.vol.next_cluster(n)
+        truncated = (n is None)  # hit EOC before reaching max_len
+        return chain, truncated, looped
+
+    def _collect_used_clusters(self):
+        """
+        Walk the whole tree, labeling owners of clusters and returning:
+            (used: dict[int,str], problems: list[str])
+        """
+        used: dict[int, str] = {}
+        problems: list[str] = []
+
+        # BFS over directories
+        q: list[tuple[int | None, str]] = []
+
+        # Seed with root
+        if self.vol.bpb.fat_type == "FAT16":
+            q.append((None, "/"))  # fixed root dir
+        else:
+            q.append((self.vol.bpb.root_clus, "/"))
+
+        seen_dirs: set[int] = set()
+
+        while q:
+            d_clus, d_path = q.pop(0)
+            entries = self.vol.list_directory(d_clus)
+            if entries is None:
+                problems.append(f"Directory read returned None for {d_path}")
+                continue
+
+            # Mark directory cluster ownership (helps detect dir cross-links)
+            if d_clus is not None and d_clus >= 2:
+                try:
+                    for c in self.vol.cluster_chain(d_clus):
+                        owner = self._canon_dir(d_path)
+                        if c in used and used[c].rstrip("/\\") != owner.rstrip("/\\"):
+                            problems.append(f"Cross-link: cluster {c} used by {used[c]} and {owner}")
+                        used.setdefault(c, owner)
+                except Exception as ex:
+                    problems.append(f"Dir chain error for {d_path}: {ex}")
+
+            for e in entries:
+                # Build full path for ownership labels
+                file_path = (d_path.rstrip("/\\") + "/" + e.name).replace("//", "/")
+
+                if e.is_dir:
+                    # enqueue subdir once
+                    if e.start_cluster and e.start_cluster >= 2 and e.start_cluster not in seen_dirs:
+                        seen_dirs.add(e.start_cluster)
+                        q.append((e.start_cluster, self._canon_dir(file_path)))
+                    continue
+
+                # Files
+                if e.size == 0:
+                    # Size 0 files should not claim any clusters; warn if the FAT points somewhere.
+                    if e.start_cluster and e.start_cluster >= 2:
+                        problems.append(f"Zero-size file with start cluster set: {file_path}")
+                    continue
+
+                if not e.start_cluster or e.start_cluster < 2:
+                    problems.append(f"File with data size but no start cluster: {file_path}")
+                    continue
+
+                need = (e.size + self.cluster_size - 1) // self.cluster_size
+
+                try:
+                    chain, truncated, looped = self._cluster_chain_upto(e.start_cluster, need)
+                except Exception as ex:
+                    problems.append(f"File chain error for {file_path}: {ex}")
+                    continue
+
+                if truncated:
+                    problems.append(
+                        f"Truncated chain for {file_path}: needs {need} clusters, chain has {len(chain)}"
+                    )
+                if looped:
+                    problems.append(f"FAT loop detected in {file_path}")
+
+                for c in chain:
+                    if c in used and used[c] != file_path:
+                        problems.append(f"Cross-link: cluster {c} used by {used[c]} and {file_path}")
+                    used.setdefault(c, file_path)
+
+        return used, problems
 
     def _cluster_chain_upto(self, start: int, max_len: int):
         """Return up to max_len clusters from the chain starting at `start`.
