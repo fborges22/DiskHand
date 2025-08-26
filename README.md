@@ -1,4 +1,4 @@
-# DiskHand
+# The DiskHand Project 🔎💿
 
 A series of specialized disk utilities for managing virtual and real disks and drives.
 
@@ -28,7 +28,7 @@ Prerequisites
 - A C++ compiler (e.g., GCC, Clang)  
 - make (or a similar build tool)
 
-## Installation 💿
+## Installation 📦
 
 - Clone the repository:
 
