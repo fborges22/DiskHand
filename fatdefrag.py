@@ -490,6 +490,13 @@ class IntegrityChecker:
         self.verbose = verbose
         self.cluster_size = vol.sec_per_clus * vol.byts_per_sec
 
+    # POSIX join independent of host OS to avoid "\" vs "/" mismatches
+    def _pjoin(self, parent: str, name: str) -> str:
+        if not parent or parent == "/":
+            return "/" + name.strip("/\\")
+        return (parent.rstrip("/\\") + "/" + name.strip("/\\")).replace("//", "/")
+
+    # Compare FAT copies for mismatches
     def _compare_fat_copies(self) -> Tuple[bool, List[int]]:
         mismatches: List[int] = []
         if self.vol.bpb.num_fats <= 1:
@@ -501,9 +508,12 @@ class IntegrityChecker:
                 mismatches.append(i)
         return (len(mismatches) == 0), mismatches
 
+    # Walk filesystem, collect used clusters, and detect issues
     def _collect_used_clusters(self) -> Tuple[Dict[int, str], List[str]]:
         used: Dict[int, str] = {}
         problems: List[str] = []
+
+        # BFS over directories starting at root
         q: List[Tuple[Optional[int], str]] = []
         if self.vol.bpb.fat_type == "FAT16":
             q.append((None, "/"))
@@ -521,43 +531,60 @@ class IntegrityChecker:
                 if e.is_dir:
                     if e.name in (".", ".."):
                         continue
-                    if e.start_cluster >= 2 and e.start_cluster not in seen_dirs:
-                        seen_dirs.add(e.start_cluster)
-                        q.append((e.start_cluster, os.path.join(path, e.name)))
                     if e.start_cluster >= 2:
+                        dir_path = self._pjoin(path, e.name)
+                        if e.start_cluster not in seen_dirs:
+                            seen_dirs.add(e.start_cluster)
+                            q.append((e.start_cluster, dir_path))
                         try:
+                            # Mark clusters of this directory's chain as used by this directory (trailing slash)
+                            this_dir = dir_path + "/"
                             for c in self.vol.cluster_chain(e.start_cluster):
-                                if c in used and used[c] != path:
-                                    problems.append(f"Cross-link: cluster {c} used by {used[c]} and {os.path.join(path, e.name)}/")
-                                used.setdefault(c, os.path.join(path, e.name) + "/")
+                                if c in used and used[c] != this_dir:
+                                    problems.append(
+                                        f"Cross-link: cluster {c} used by {used[c]} and {this_dir}"
+                                    )
+                                used.setdefault(c, this_dir)
                         except Exception as ex:
-                            problems.append(f"Dir chain error for {os.path.join(path, e.name)}: {ex}")
+                            problems.append(f"Dir chain error for {dir_path}: {ex}")
                 else:
+                    # Regular file
                     if e.start_cluster >= 2 and e.size > 0:
+                        file_path = self._pjoin(path, e.name)
                         try:
                             chain = self.vol.cluster_chain(e.start_cluster)
                         except Exception as ex:
-                            problems.append(f"File chain error for {os.path.join(path, e.name)}: {ex}")
+                            problems.append(f"File chain error for {file_path}: {ex}")
                             continue
+
+                        # Size vs chain length sanity
                         need = (e.size + self.cluster_size - 1) // self.cluster_size
                         if len(chain) < need:
-                            problems.append(f"Truncated chain for {os.path.join(path, e.name)}: needs {need} clusters, chain has {len(chain)}")
+                            problems.append(
+                                f"Truncated chain for {file_path}: needs {need} clusters, chain has {len(chain)}"
+                            )
+
                         for c in chain:
-                            if c in used and used[c] != path:
-                                problems.append(f"Cross-link: cluster {c} used by {used[c]} and {os.path.join(path, e.name)}")
-                            used.setdefault(c, os.path.join(path, e.name))
+                            if c in used and used[c] != file_path:
+                                problems.append(
+                                    f"Cross-link: cluster {c} used by {used[c]} and {file_path}"
+                                )
+                            used.setdefault(c, file_path)
+
         return used, problems
 
+    # Any allocated cluster not referenced by a file/dir is an orphan
     def _find_orphans(self, used: Dict[int, str]) -> List[int]:
         orphans: List[int] = []
         for c in range(2, len(self.vol.fat)):
             v = self.vol.fat[c]
             if v == self.vol.free_value:
-                continue
+                continue  # free
             if c not in used:
                 orphans.append(c)
         return orphans
 
+    # Basic sanity on reserved FAT entries
     def _check_boot_reserved(self) -> List[str]:
         issues: List[str] = []
         f0 = self.vol.fat[0]
@@ -573,6 +600,7 @@ class IntegrityChecker:
                 issues.append("FAT[1] not marked EOC for FAT32")
         return issues
 
+    # FSInfo consistency (FAT32 only)
     def _check_fsinfo(self) -> List[str]:
         notes: List[str] = []
         if self.vol.bpb.fat_type != "FAT32" or self.vol.bpb.fsinfo == 0:
@@ -588,19 +616,28 @@ class IntegrityChecker:
             notes.append("FSInfo next-free hint out of range")
         return notes
 
+    # Run full integrity suite
     def run(self) -> bool:
         ok = True
+
+        # FAT copies identical?
         fats_ok, mism = self._compare_fat_copies()
         if not fats_ok:
             ok = False
             print(f"ERROR: FAT copy mismatch detected in copies: {mism}")
+
+        # Reserved entries heuristics
         for issue in self._check_boot_reserved():
             print("WARN:", issue)
+
+        # Usage map + structural problems
         used, problems = self._collect_used_clusters()
         for p in problems:
             if "Cross-link" in p or "chain error" in p or "Truncated" in p:
                 ok = False
             print(("ERROR:" if ("Cross-link" in p or "chain error" in p or "Truncated" in p) else "WARN:"), p)
+
+        # Orphans (lost chains)
         orphans = self._find_orphans(used)
         if orphans:
             msg = f"Found {len(orphans)} orphan allocated clusters (lost chains)"
@@ -609,9 +646,12 @@ class IntegrityChecker:
                 print("  sample:", orphans[:20])
             if self.strict:
                 ok = False
+
+        # FSInfo notes
         for note in self._check_fsinfo():
             print("NOTE:", note)
-        # Fragmentation summary
+
+        # Fragmentation summary (nice-to-have)
         frag_files = 0
         total_files = 0
         q: List[Tuple[Optional[int], str]] = []
@@ -627,7 +667,7 @@ class IntegrityChecker:
                     if e.name in (".", ".."):
                         continue
                     if e.start_cluster >= 2:
-                        q.append((e.start_cluster, os.path.join(path, e.name)))
+                        q.append((e.start_cluster, self._pjoin(path, e.name)))
                 else:
                     if e.start_cluster >= 2 and e.size > 0:
                         total_files += 1
