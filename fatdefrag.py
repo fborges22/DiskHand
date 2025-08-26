@@ -520,6 +520,26 @@ class IntegrityChecker:
         self.verbose = verbose
         self.cluster_size = vol.sec_per_clus * vol.byts_per_sec
 
+    def _cluster_chain_upto(self, start: int, max_len: int):
+        """Return up to max_len clusters from the chain starting at `start`.
+        Also returns flags: truncated (chain shorter than max_len), looped."""
+        chain = []
+        seen = set()
+        n = start
+        looped = False
+        while n is not None and len(chain) < max_len:
+            if n in seen:
+                looped = True
+                break
+            seen.add(n)
+            chain.append(n)
+            try:
+                n = self.vol.next_cluster(n)
+            except ValueError as ex:  # BAD cluster
+                raise
+        truncated = (n is None)  # hit EOC before reaching max_len
+        return chain, truncated, looped
+
     # POSIX join independent of host OS to avoid "\" vs "/" mismatches
     def _pjoin(self, parent: str, name: str) -> str:
         if not parent or parent == "/":
@@ -595,16 +615,22 @@ class IntegrityChecker:
 
                         # Size vs chain length sanity
                         need = (e.size + self.cluster_size - 1) // self.cluster_size
-                        if len(chain) < need:
+                        try:
+                            chain, truncated, looped = self._cluster_chain_upto(e.start_cluster, need)
+                        except Exception as ex:
+                            problems.append(f"File chain error for {file_path}: {ex}")
+                            continue
+
+                        if truncated:
                             problems.append(
                                 f"Truncated chain for {file_path}: needs {need} clusters, chain has {len(chain)}"
                             )
+                        if looped:
+                            problems.append(f"FAT loop detected in {file_path}")
 
                         for c in chain:
                             if c in used and used[c] != file_path:
-                                problems.append(
-                                    f"Cross-link: cluster {c} used by {used[c]} and {file_path}"
-                                )
+                                problems.append(f"Cross-link: cluster {c} used by {used[c]} and {file_path}")
                             used.setdefault(c, file_path)
 
         return used, problems
