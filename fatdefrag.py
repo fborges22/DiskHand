@@ -563,14 +563,20 @@ class IntegrityChecker:
                         continue
                     if e.start_cluster >= 2:
                         dir_path = self._pjoin(path, e.name)
+
+                        # Canonical label: exactly one trailing slash, no doubles
+                        def canon_dir(p: str) -> str:
+                            return p.rstrip("/\\") + "/"
+                        
+                        this_dir = canon_dir(dir_path)
+
                         if e.start_cluster not in seen_dirs:
                             seen_dirs.add(e.start_cluster)
                             q.append((e.start_cluster, dir_path))
                         try:
-                            # Mark clusters of this directory's chain as used by this directory (trailing slash)
-                            this_dir = dir_path + "/"
                             for c in self.vol.cluster_chain(e.start_cluster):
-                                if c in used and used[c] != this_dir:
+                                # Compare canonically to avoid "/DOS/" vs "/DOS//"
+                                if c in used and used[c].rstrip("/\\") != this_dir.rstrip("/\\"):
                                     problems.append(
                                         f"Cross-link: cluster {c} used by {used[c]} and {this_dir}"
                                     )
