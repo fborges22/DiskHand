@@ -286,14 +286,9 @@ def main():
 
     parts, total_sectors = plan_partitions(sizes_bytes)
 
-    # Create/truncate the image and write MBR
+    # Create/truncate the image, write the MBR, then format each partition.
     with open(args.image, "wb+") as f:
         write_mbr(f, parts, total_sectors)
-        # Format each partition as FAT16
-        for p in parts:
-            label = f"{args.label-prefix}{p['index']}" if hasattr(args, "label-prefix") else None
-        # Correct label attribute (argparse uses underscore)
-    with open(args.image, "rb+") as f:
         for p in parts:
             label = f"{args.label_prefix}{p['index']}" if args.label_prefix else "NO NAME"
             print(f"Formatting partition p{p['index']} @ LBA {p['start_lba']} "
