@@ -36,6 +36,7 @@ Make a backup first:
 """
 from __future__ import annotations
 import argparse
+import hashlib
 import io
 import os
 import struct
@@ -258,6 +259,12 @@ class DirEntry:
     is_dir: bool
     raw_offset: int
 
+
+def _fat_entry_cluster_field_offsets(fat_type: str) -> Tuple[int, ...]:
+    if fat_type == "FAT32":
+        return (20, 21, 26, 27)
+    return (26, 27)
+
 ATTR_READ_ONLY = 0x01
 ATTR_HIDDEN = 0x02
 ATTR_SYSTEM = 0x04
@@ -288,6 +295,7 @@ class FatVolume:
     eoc: int
     free_value: int
     fat_bits: int
+    max_cluster: int
     fat: List[int] = field(default_factory=list)
 
     @staticmethod
@@ -308,6 +316,10 @@ class FatVolume:
         else:
             root_dir_first_sector = first_fat_sector + bpb.num_fats * fatsz
         first_data_sector = first_fat_sector + bpb.num_fats * fatsz + root_dir_sectors
+        tot_sec = bpb.tot_sec_16 if bpb.tot_sec_16 else bpb.tot_sec_32
+        data_sectors = tot_sec - (bpb.rsvd_sec_cnt + bpb.num_fats * fatsz + root_dir_sectors)
+        cluster_count = data_sectors // sec_per_clus if sec_per_clus else 0
+        max_cluster = cluster_count + 1
 
         eoc = EOC32 if bpb.fat_type == "FAT32" else EOC16
         free_value = FREE32 if bpb.fat_type == "FAT32" else FREE16
@@ -317,11 +329,14 @@ class FatVolume:
             first_data_sector=first_data_sector, first_fat_sector=first_fat_sector,
             root_dir_first_sector=root_dir_first_sector, root_dir_sectors=root_dir_sectors,
             fatsz=fatsz, eoc=eoc, free_value=free_value, fat_bits=bpb.fat_bits,
+            max_cluster=max_cluster,
         )
         vol.load_fat()
         return vol
 
     def first_sector_of_cluster(self, n: int) -> int:
+        if n < 2 or n > self.max_cluster:
+            raise ValueError(f"Cluster index out of data range: {n}")
         return self.first_data_sector + (n - 2) * self.sec_per_clus
 
     def cluster_offset_bytes(self, n: int) -> int:
@@ -346,23 +361,25 @@ class FatVolume:
         for i in range(self.bpb.num_fats):
             off = (self.first_fat_sector + i * self.fatsz) * self.byts_per_sec
             write_at(self.f, off, out)
+        self.f.flush()
+        os.fsync(self.f.fileno())
 
     def next_cluster(self, n: int) -> Optional[int]:
-        if n < 2 or n >= len(self.fat):
+        if n < 2 or n > self.max_cluster:
             raise ValueError(f"Cluster index out of range: {n}")
         v = self.fat[n]
         if self.bpb.fat_type == "FAT16":
             if v >= EOC16: return None
             if v == BAD16: raise ValueError("Encountered BAD cluster")
-            if v == FREE16: return None
-            if v < 2 or v >= len(self.fat):
+            if v == FREE16: raise ValueError("Encountered FREE cluster in chain")
+            if v < 2 or v > self.max_cluster:
                 raise ValueError(f"Next cluster out of range: {v}")
             return v
         else:
             if v >= EOC32: return None
             if v == BAD32: raise ValueError("Encountered BAD cluster")
-            if v == FREE32: return None
-            if v < 2 or v >= len(self.fat):
+            if v == FREE32: raise ValueError("Encountered FREE cluster in chain")
+            if v < 2 or v > self.max_cluster:
                 raise ValueError(f"Next cluster out of range: {v}")
             return v
 
@@ -513,16 +530,30 @@ class FatVolume:
             struct.pack_into("<H", sec, i+20, (new_start >> 16) & 0xFFFF)
         write_at(self.f, sec_off, bytes(sec))
 
+    def read_dir_start_cluster(self, entry: DirEntry) -> int:
+        sec_off = entry.raw_offset - (entry.raw_offset % self.byts_per_sec)
+        sec = read_at(self.f, sec_off, self.byts_per_sec)
+        i = entry.raw_offset - sec_off
+        start_lo = struct.unpack_from("<H", sec, i + 26)[0]
+        start_hi = struct.unpack_from("<H", sec, i + 20)[0] if self.bpb.fat_type == "FAT32" else 0
+        return (start_hi << 16) | start_lo
+
+    def read_dir_entry_bytes(self, entry: DirEntry) -> bytes:
+        sec_off = entry.raw_offset - (entry.raw_offset % self.byts_per_sec)
+        sec = read_at(self.f, sec_off, self.byts_per_sec)
+        i = entry.raw_offset - sec_off
+        return sec[i:i+32]
+
     def update_fsinfo(self) -> None:
         if self.bpb.fat_type != "FAT32" or self.bpb.fsinfo == 0:
             return
         fsinfo_sec = (self.part.lba_start + self.bpb.fsinfo) * self.byts_per_sec
         sec = bytearray(read_at(self.f, fsinfo_sec, 512))
-        free = sum(1 for v in self.fat[2:] if v == self.free_value)
+        free = sum(1 for v in self.fat[2:self.max_cluster + 1] if v == self.free_value)
         hint = 2
-        while hint < len(self.fat) and self.fat[hint] != self.free_value:
+        while hint <= self.max_cluster and self.fat[hint] != self.free_value:
             hint += 1
-        if hint >= len(self.fat):
+        if hint > self.max_cluster:
             hint = 0xFFFFFFFF
         struct.pack_into("<I", sec, 0x1E4, free if free < 0xFFFFFFFF else 0xFFFFFFFF)
         struct.pack_into("<I", sec, 0x1E8, hint)
@@ -625,6 +656,14 @@ class IntegrityChecker:
                     if e.start_cluster >= 2 and e.size > 0:
                         total_files += 1
                         file_path = self._pjoin(path, e.name)
+                        if e.start_cluster > self.vol.max_cluster:
+                            problems.append(
+                                f"Invalid first cluster for {file_path}: cluster {e.start_cluster} exceeds max {self.vol.max_cluster}"
+                            )
+                            continue
+                        if self.vol.fat[e.start_cluster] == self.vol.free_value:
+                            problems.append(f"Invalid first cluster for {file_path}: cluster {e.start_cluster} is free")
+                            continue
                         need = (e.size + self.cluster_size - 1) // self.cluster_size
                         try:
                             chain, truncated, looped, overlong = self._cluster_chain_upto(e.start_cluster, need)
@@ -660,7 +699,7 @@ class IntegrityChecker:
     # Any allocated cluster not referenced by a file/dir is an orphan
     def _find_orphans(self, used: Dict[int, str]) -> List[int]:
         orphans: List[int] = []
-        for c in range(2, len(self.vol.fat)):
+        for c in range(2, self.vol.max_cluster + 1):
             v = self.vol.fat[c]
             if v == self.vol.free_value:
                 continue  # free
@@ -692,11 +731,11 @@ class IntegrityChecker:
         fsinfo_off = (self.vol.part.lba_start + self.vol.bpb.fsinfo) * self.vol.byts_per_sec
         sec = read_at(self.vol.f, fsinfo_off, 512)
         cached = struct.unpack_from("<I", sec, 0x1E4)[0]
-        computed = sum(1 for v in self.vol.fat[2:] if v == self.vol.free_value)
+        computed = sum(1 for v in self.vol.fat[2:self.vol.max_cluster + 1] if v == self.vol.free_value)
         if cached != 0xFFFFFFFF and cached != computed:
             notes.append(f"FSInfo free count {cached} != computed {computed}")
         hint = struct.unpack_from("<I", sec, 0x1E8)[0]
-        if hint != 0xFFFFFFFF and (hint < 2 or hint >= len(self.vol.fat)):
+        if hint != 0xFFFFFFFF and (hint < 2 or hint > self.vol.max_cluster):
             notes.append("FSInfo next-free hint out of range")
         return notes
 
@@ -717,9 +756,9 @@ class IntegrityChecker:
         # Usage map + structural problems
         used, problems, frag_files, total_files = self._scan_filesystem()
         for p in problems:
-            if "Cross-link" in p or "chain error" in p or "Truncated" in p or "Overlong" in p:
+            if "Cross-link" in p or "chain error" in p or "Truncated" in p or "Overlong" in p or "Invalid first cluster" in p:
                 ok = False
-            print(("ERROR:" if ("Cross-link" in p or "chain error" in p or "Truncated" in p or "Overlong" in p) else "WARN:"), p)
+            print(("ERROR:" if ("Cross-link" in p or "chain error" in p or "Truncated" in p or "Overlong" in p or "Invalid first cluster" in p) else "WARN:"), p)
 
         # Orphans (lost chains)
         orphans = self._find_orphans(used)
@@ -752,7 +791,7 @@ class Defragmenter:
         self.verbose = verbose
         self.cluster_size = vol.sec_per_clus * vol.byts_per_sec
         self.next_free_cursor = 2
-        self.free = [i for i in range(len(vol.fat)) if i >= 2 and vol.fat[i] == vol.free_value]
+        self.free = [i for i in range(2, vol.max_cluster + 1) if vol.fat[i] == vol.free_value]
         self.free_set = set(self.free)
         if self.verbose:
             print(f"Free clusters: {len(self.free)}")
@@ -762,7 +801,7 @@ class Defragmenter:
         run_start = None
         run_len = 0
         i = start
-        last = len(self.vol.fat) - 1
+        last = self.vol.max_cluster
         while i <= last:
             if self.vol.fat[i] == self.vol.free_value:
                 if run_start is None:
@@ -803,6 +842,49 @@ class Defragmenter:
             if file_prog: file_prog.update(1)
             if overall:   overall.update(1)
 
+    def _required_clusters(self, entry: DirEntry) -> int:
+        return (entry.size + self.cluster_size - 1) // self.cluster_size
+
+    def _file_data_digest(self, entry: DirEntry, chain: List[int]) -> str:
+        remaining = entry.size
+        digest = hashlib.sha1()
+        for cluster in chain:
+            if remaining <= 0:
+                break
+            chunk = self.vol.cluster_read(cluster)
+            take = min(len(chunk), remaining)
+            digest.update(chunk[:take])
+            remaining -= take
+        if remaining != 0:
+            raise ValueError(f"Digest verification length mismatch for {entry.name}")
+        return digest.hexdigest()
+
+    def _validated_file_chain(self, entry: DirEntry, start_cluster: Optional[int] = None) -> List[int]:
+        start = entry.start_cluster if start_cluster is None else start_cluster
+        if entry.size == 0:
+            return []
+        if start < 2:
+            raise ValueError(f"Invalid start cluster {start} for {entry.name}")
+        if self.vol.fat[start] == self.vol.free_value:
+            raise ValueError(f"First cluster {start} is free for {entry.name}")
+
+        need = self._required_clusters(entry)
+        chain: List[int] = []
+        seen = set()
+        n = start
+        while n is not None and len(chain) < need:
+            if n in seen:
+                raise ValueError(f"FAT loop detected for {entry.name}")
+            seen.add(n)
+            chain.append(n)
+            n = self.vol.next_cluster(n)
+
+        if len(chain) < need:
+            raise ValueError(f"Truncated chain for {entry.name}: needs {need}, has {len(chain)}")
+        if n is not None:
+            raise ValueError(f"Overlong chain for {entry.name}: exceeds {need} clusters")
+        return chain
+
     def _gather_files(self) -> List[DirEntry]:
         q: List[Tuple[Optional[int], str]] = [(None, "/")] if self.vol.bpb.fat_type == "FAT16" else [(self.vol.bpb.root_clus, "/")]
         files: List[DirEntry] = []
@@ -823,13 +905,17 @@ class Defragmenter:
 
     def plan(self) -> List[FilePlan]:
         plans: List[FilePlan] = []
-        files = self._gather_files()
-        files.sort(key=lambda e: e.raw_offset)
-        for e in files:
+        candidates = []
+        for e in self._gather_files():
             if e.start_cluster < 2 or e.size == 0:
                 continue
-            old_chain = self.vol.cluster_chain(e.start_cluster)
-            need = (e.size + self.cluster_size - 1) // self.cluster_size
+            old_chain = self._validated_file_chain(e)
+            candidates.append((old_chain[0], e.raw_offset, e, old_chain))
+
+        candidates.sort(key=lambda item: (item[0], item[1]))
+
+        for _, _, e, old_chain in candidates:
+            need = self._required_clusters(e)
             contiguous = all(old_chain[i] + 1 == old_chain[i+1] for i in range(len(old_chain)-1))
             if contiguous and old_chain[0] >= self.next_free_cursor:
                 self.next_free_cursor = old_chain[-1] + 1
@@ -851,11 +937,27 @@ class Defragmenter:
                 print(f"[{i}/{len(plans)}] {p.entry.name}: {len(p.old_chain)} clu -> {len(p.new_chain)} clu at {p.new_start}")
             if dry_run:
                 continue
+            expected_digest = self._file_data_digest(p.entry, p.old_chain)
+            before_entry = self.vol.read_dir_entry_bytes(p.entry)
             file_prog = Progress(len(p.new_chain), prefix=f"{p.entry.name[:30]:<30}") if show_progress else None
             self._copy_chain_data(p.old_chain, p.new_chain, file_prog, overall)
             if file_prog: file_prog.close()
             self._write_chain_links(p.new_start, len(p.new_chain))
             self.vol.update_dir_start_cluster(p.entry, p.new_start)
+            written_start = self.vol.read_dir_start_cluster(p.entry)
+            if written_start != p.new_start:
+                raise IOError(f"Directory entry update failed for {p.entry.name}: expected {p.new_start}, found {written_start}")
+            after_entry = self.vol.read_dir_entry_bytes(p.entry)
+            allowed_offsets = set(_fat_entry_cluster_field_offsets(self.vol.bpb.fat_type))
+            changed_offsets = {idx for idx, (before, after) in enumerate(zip(before_entry, after_entry)) if before != after}
+            if not changed_offsets.issubset(allowed_offsets):
+                raise IOError(f"Unexpected directory entry changes for {p.entry.name}: {sorted(changed_offsets)}")
+            verified_chain = self._validated_file_chain(p.entry, start_cluster=p.new_start)
+            if verified_chain != p.new_chain:
+                raise IOError(f"Verification failed for {p.entry.name}: expected {p.new_chain}, found {verified_chain}")
+            actual_digest = self._file_data_digest(p.entry, verified_chain)
+            if actual_digest != expected_digest:
+                raise IOError(f"Content verification failed for {p.entry.name}")
             self._release_old_chain(p.old_chain)
         if not dry_run:
             self.vol.flush_fat()
