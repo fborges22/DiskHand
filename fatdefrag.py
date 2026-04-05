@@ -348,16 +348,22 @@ class FatVolume:
             write_at(self.f, off, out)
 
     def next_cluster(self, n: int) -> Optional[int]:
+        if n < 2 or n >= len(self.fat):
+            raise ValueError(f"Cluster index out of range: {n}")
         v = self.fat[n]
         if self.bpb.fat_type == "FAT16":
             if v >= EOC16: return None
             if v == BAD16: raise ValueError("Encountered BAD cluster")
             if v == FREE16: return None
+            if v < 2 or v >= len(self.fat):
+                raise ValueError(f"Next cluster out of range: {v}")
             return v
         else:
             if v >= EOC32: return None
             if v == BAD32: raise ValueError("Encountered BAD cluster")
             if v == FREE32: return None
+            if v < 2 or v >= len(self.fat):
+                raise ValueError(f"Next cluster out of range: {v}")
             return v
 
     def cluster_chain(self, start: int) -> List[int]:
@@ -535,7 +541,7 @@ class IntegrityChecker:
 
     def _cluster_chain_upto(self, start: int, max_len: int):
         """Return up to max_len clusters from the chain starting at `start`.
-        Also returns flags: truncated (chain shorter than max_len), looped."""
+        Also returns flags: truncated (chain shorter than max_len), looped, overlong."""
         chain = []
         seen = set()
         n = start
@@ -551,7 +557,8 @@ class IntegrityChecker:
             except ValueError as ex:  # BAD cluster
                 raise
         truncated = len(chain) < max_len and n is None
-        return chain, truncated, looped
+        overlong = len(chain) == max_len and n is not None and not looped
+        return chain, truncated, looped, overlong
 
     # POSIX join independent of host OS to avoid "\" vs "/" mismatches
     def _pjoin(self, parent: str, name: str) -> str:
@@ -571,10 +578,12 @@ class IntegrityChecker:
                 mismatches.append(i)
         return (len(mismatches) == 0), mismatches
 
-    # Walk filesystem, collect used clusters, and detect issues
-    def _collect_used_clusters(self) -> Tuple[Dict[int, str], List[str]]:
+    # Walk filesystem once, collect used clusters, detect issues, and count fragmentation.
+    def _scan_filesystem(self) -> Tuple[Dict[int, str], List[str], int, int]:
         used: Dict[int, str] = {}
         problems: List[str] = []
+        frag_files = 0
+        total_files = 0
 
         # BFS over directories starting at root
         q: List[Tuple[Optional[int], str]] = []
@@ -614,17 +623,11 @@ class IntegrityChecker:
                 else:
                     # Regular file
                     if e.start_cluster >= 2 and e.size > 0:
+                        total_files += 1
                         file_path = self._pjoin(path, e.name)
-                        try:
-                            chain = self.vol.cluster_chain(e.start_cluster)
-                        except Exception as ex:
-                            problems.append(f"File chain error for {file_path}: {ex}")
-                            continue
-
-                        # Size vs chain length sanity
                         need = (e.size + self.cluster_size - 1) // self.cluster_size
                         try:
-                            chain, truncated, looped = self._cluster_chain_upto(e.start_cluster, need)
+                            chain, truncated, looped, overlong = self._cluster_chain_upto(e.start_cluster, need)
                         except Exception as ex:
                             problems.append(f"File chain error for {file_path}: {ex}")
                             continue
@@ -635,12 +638,23 @@ class IntegrityChecker:
                             )
                         if looped:
                             problems.append(f"FAT loop detected in {file_path}")
+                        if overlong:
+                            problems.append(
+                                f"Overlong chain for {file_path}: size needs {need} clusters, chain continues past file data"
+                            )
+
+                        if any(chain[i] + 1 != chain[i+1] for i in range(len(chain)-1)):
+                            frag_files += 1
 
                         for c in chain:
                             if c in used and used[c] != file_path:
                                 problems.append(f"Cross-link: cluster {c} used by {used[c]} and {file_path}")
                             used.setdefault(c, file_path)
 
+        return used, problems, frag_files, total_files
+
+    def _collect_used_clusters(self) -> Tuple[Dict[int, str], List[str]]:
+        used, problems, _, _ = self._scan_filesystem()
         return used, problems
 
     # Any allocated cluster not referenced by a file/dir is an orphan
@@ -701,11 +715,11 @@ class IntegrityChecker:
             print("WARN:", issue)
 
         # Usage map + structural problems
-        used, problems = self._collect_used_clusters()
+        used, problems, frag_files, total_files = self._scan_filesystem()
         for p in problems:
-            if "Cross-link" in p or "chain error" in p or "Truncated" in p:
+            if "Cross-link" in p or "chain error" in p or "Truncated" in p or "Overlong" in p:
                 ok = False
-            print(("ERROR:" if ("Cross-link" in p or "chain error" in p or "Truncated" in p) else "WARN:"), p)
+            print(("ERROR:" if ("Cross-link" in p or "chain error" in p or "Truncated" in p or "Overlong" in p) else "WARN:"), p)
 
         # Orphans (lost chains)
         orphans = self._find_orphans(used)
@@ -721,29 +735,6 @@ class IntegrityChecker:
         for note in self._check_fsinfo():
             print("NOTE:", note)
 
-        # Fragmentation summary (nice-to-have)
-        frag_files = 0
-        total_files = 0
-        q: List[Tuple[Optional[int], str]] = []
-        if self.vol.bpb.fat_type == "FAT16":
-            q.append((None, "/"))
-        else:
-            q.append((self.vol.bpb.root_clus, "/"))
-        while q:
-            start, path = q.pop(0)
-            entries = self.vol.list_directory(start)
-            for e in entries:
-                if e.is_dir:
-                    if e.name in (".", ".."):
-                        continue
-                    if e.start_cluster >= 2:
-                        q.append((e.start_cluster, self._pjoin(path, e.name)))
-                else:
-                    if e.start_cluster >= 2 and e.size > 0:
-                        total_files += 1
-                        chain = self.vol.cluster_chain(e.start_cluster)
-                        if any(chain[i] + 1 != chain[i+1] for i in range(len(chain)-1)):
-                            frag_files += 1
         print(f"Summary: {frag_files}/{total_files} files are fragmented.")
         return ok
 
