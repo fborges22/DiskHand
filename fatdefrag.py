@@ -410,17 +410,19 @@ class FatVolume:
 
         entries: list[DirEntry] = []
         lfn_stack: list[bytes] = []
+        stop = False
 
         def parse_sector(off: int, sec: bytes):
-            nonlocal entries, lfn_stack
+            nonlocal entries, lfn_stack, stop
             for i in range(0, len(sec), 32):
                 e = sec[i:i+32]
                 raw_off = off + i
 
                 name0 = e[0]
                 if name0 == 0x00:
-                    # end of directory
+                    # End-of-directory marker: no valid entries follow in later sectors either.
                     lfn_stack.clear()
+                    stop = True
                     return
                 if name0 == 0xE5:
                     # deleted entry; discard any pending LFN
@@ -470,6 +472,8 @@ class FatVolume:
             # FAT16 root directory lives in a fixed area
             for off, sec in self.iter_root_dir_sectors():
                 parse_sector(off, sec)
+                if stop:
+                    break
         else:
             # Subdirectory (FAT16) or any directory (FAT32) via cluster chain
             if start_cluster is None or start_cluster < 2:
@@ -477,6 +481,8 @@ class FatVolume:
                 return entries
             for off, sec in self.iter_dir_chain(start_cluster):
                 parse_sector(off, sec)
+                if stop:
+                    break
 
         return entries
 
@@ -525,108 +531,7 @@ class IntegrityChecker:
         self.cluster_size = vol.sec_per_clus * vol.byts_per_sec
 
     def _canon_dir(self, p: str) -> str:
-        """Canonical directory label for ownership comparisons."""
         return p.rstrip("/\\") + "/"
-
-    def _cluster_chain_upto(self, start: int, max_len: int):
-        """
-        Return up to `max_len` clusters from the chain starting at `start`.
-        Also returns (truncated, looped) flags.
-        """
-        chain = []
-        seen = set()
-        n = start
-        looped = False
-        while n is not None and len(chain) < max_len:
-            if n in seen:
-                looped = True
-                break
-            seen.add(n)
-            chain.append(n)
-            n = self.vol.next_cluster(n)
-        truncated = (n is None)  # hit EOC before reaching max_len
-        return chain, truncated, looped
-
-    def _collect_used_clusters(self):
-        """
-        Walk the whole tree, labeling owners of clusters and returning:
-            (used: dict[int,str], problems: list[str])
-        """
-        used: dict[int, str] = {}
-        problems: list[str] = []
-
-        # BFS over directories
-        q: list[tuple[int | None, str]] = []
-
-        # Seed with root
-        if self.vol.bpb.fat_type == "FAT16":
-            q.append((None, "/"))  # fixed root dir
-        else:
-            q.append((self.vol.bpb.root_clus, "/"))
-
-        seen_dirs: set[int] = set()
-
-        while q:
-            d_clus, d_path = q.pop(0)
-            entries = self.vol.list_directory(d_clus)
-            if entries is None:
-                problems.append(f"Directory read returned None for {d_path}")
-                continue
-
-            # Mark directory cluster ownership (helps detect dir cross-links)
-            if d_clus is not None and d_clus >= 2:
-                try:
-                    for c in self.vol.cluster_chain(d_clus):
-                        owner = self._canon_dir(d_path)
-                        if c in used and used[c].rstrip("/\\") != owner.rstrip("/\\"):
-                            problems.append(f"Cross-link: cluster {c} used by {used[c]} and {owner}")
-                        used.setdefault(c, owner)
-                except Exception as ex:
-                    problems.append(f"Dir chain error for {d_path}: {ex}")
-
-            for e in entries:
-                # Build full path for ownership labels
-                file_path = (d_path.rstrip("/\\") + "/" + e.name).replace("//", "/")
-
-                if e.is_dir:
-                    # enqueue subdir once
-                    if e.start_cluster and e.start_cluster >= 2 and e.start_cluster not in seen_dirs:
-                        seen_dirs.add(e.start_cluster)
-                        q.append((e.start_cluster, self._canon_dir(file_path)))
-                    continue
-
-                # Files
-                if e.size == 0:
-                    # Size 0 files should not claim any clusters; warn if the FAT points somewhere.
-                    if e.start_cluster and e.start_cluster >= 2:
-                        problems.append(f"Zero-size file with start cluster set: {file_path}")
-                    continue
-
-                if not e.start_cluster or e.start_cluster < 2:
-                    problems.append(f"File with data size but no start cluster: {file_path}")
-                    continue
-
-                need = (e.size + self.cluster_size - 1) // self.cluster_size
-
-                try:
-                    chain, truncated, looped = self._cluster_chain_upto(e.start_cluster, need)
-                except Exception as ex:
-                    problems.append(f"File chain error for {file_path}: {ex}")
-                    continue
-
-                if truncated:
-                    problems.append(
-                        f"Truncated chain for {file_path}: needs {need} clusters, chain has {len(chain)}"
-                    )
-                if looped:
-                    problems.append(f"FAT loop detected in {file_path}")
-
-                for c in chain:
-                    if c in used and used[c] != file_path:
-                        problems.append(f"Cross-link: cluster {c} used by {used[c]} and {file_path}")
-                    used.setdefault(c, file_path)
-
-        return used, problems
 
     def _cluster_chain_upto(self, start: int, max_len: int):
         """Return up to max_len clusters from the chain starting at `start`.
@@ -645,7 +550,7 @@ class IntegrityChecker:
                 n = self.vol.next_cluster(n)
             except ValueError as ex:  # BAD cluster
                 raise
-        truncated = (n is None)  # hit EOC before reaching max_len
+        truncated = len(chain) < max_len and n is None
         return chain, truncated, looped
 
     # POSIX join independent of host OS to avoid "\" vs "/" mismatches
@@ -691,12 +596,7 @@ class IntegrityChecker:
                         continue
                     if e.start_cluster >= 2:
                         dir_path = self._pjoin(path, e.name)
-
-                        # Canonical label: exactly one trailing slash, no doubles
-                        def canon_dir(p: str) -> str:
-                            return p.rstrip("/\\") + "/"
-                        
-                        this_dir = canon_dir(dir_path)
+                        this_dir = self._canon_dir(dir_path)
 
                         if e.start_cluster not in seen_dirs:
                             seen_dirs.add(e.start_cluster)
@@ -1073,7 +973,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             print("Invalid or non-FAT partition selected.")
             return 1
 
-    if not args.dry_run and not args.inplace:
+    if not args.dry_run and not args.check_only and not args.inplace:
         print("Refusing to modify image without --inplace. Use --dry-run to preview.")
         return 1
 
