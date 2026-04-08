@@ -394,15 +394,15 @@ def render_cluster_map(clusters, cols, scale, stats, info):
     # Palette tuned to resemble old disk check maps.
     palette = {
         "bg": (204, 204, 204),
-        "free": (12, 150, 150),
-        "used": (0, 225, 225),
-        "partial": (245, 210, 70),
+        "free": (10, 60, 48),
+        "used": (115, 230, 203),
+        "partial": (62, 187, 158),
         "bad": (220, 45, 35),
         "empty": (180, 180, 180),
         "frame": (40, 40, 40),
-        "legend_free": (12, 150, 150),
-        "legend_used": (0, 225, 225),
-        "legend_partial": (245, 210, 70),
+        "legend_free": (10, 60, 48),
+        "legend_used": (115, 230, 203),
+        "legend_partial": (62, 187, 158),
         "legend_bad": (220, 45, 35),
         "text": (20, 20, 20),
     }
@@ -470,8 +470,8 @@ def render_cluster_map(clusters, cols, scale, stats, info):
 
     legend_rows = [
         ("FREE", stats["free"], palette["legend_free"]),
-        ("USED", stats["used"], palette["legend_used"]),
         ("PARTIAL", stats["partial"], palette["legend_partial"]),
+        ("USED", stats["used"], palette["legend_used"]),
         ("BAD", stats["bad"], palette["legend_bad"]),
     ]
 
