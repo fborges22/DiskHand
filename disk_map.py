@@ -181,35 +181,230 @@ def write_png_rgb(path, width, height, rgb_bytes):
         out.write(png_chunk(b"IEND", b""))
 
 
-def render_cluster_map(clusters, cols, scale):
+FONT_5X7 = {
+    " ": ["00000", "00000", "00000", "00000", "00000", "00000", "00000"],
+    "-": ["00000", "00000", "00000", "11111", "00000", "00000", "00000"],
+    ".": ["00000", "00000", "00000", "00000", "00000", "01100", "01100"],
+    ":": ["00000", "00100", "00000", "00000", "00100", "00000", "00000"],
+    "/": ["00001", "00010", "00100", "01000", "10000", "00000", "00000"],
+    "%": ["11001", "11010", "00100", "01000", "10110", "00110", "00000"],
+    "(": ["00010", "00100", "01000", "01000", "01000", "00100", "00010"],
+    ")": ["01000", "00100", "00010", "00010", "00010", "00100", "01000"],
+    "0": ["01110", "10001", "10011", "10101", "11001", "10001", "01110"],
+    "1": ["00100", "01100", "00100", "00100", "00100", "00100", "01110"],
+    "2": ["01110", "10001", "00001", "00010", "00100", "01000", "11111"],
+    "3": ["11110", "00001", "00001", "01110", "00001", "00001", "11110"],
+    "4": ["00010", "00110", "01010", "10010", "11111", "00010", "00010"],
+    "5": ["11111", "10000", "10000", "11110", "00001", "00001", "11110"],
+    "6": ["01110", "10000", "10000", "11110", "10001", "10001", "01110"],
+    "7": ["11111", "00001", "00010", "00100", "01000", "01000", "01000"],
+    "8": ["01110", "10001", "10001", "01110", "10001", "10001", "01110"],
+    "9": ["01110", "10001", "10001", "01111", "00001", "00001", "01110"],
+    "A": ["01110", "10001", "10001", "11111", "10001", "10001", "10001"],
+    "B": ["11110", "10001", "10001", "11110", "10001", "10001", "11110"],
+    "C": ["01110", "10001", "10000", "10000", "10000", "10001", "01110"],
+    "D": ["11110", "10001", "10001", "10001", "10001", "10001", "11110"],
+    "E": ["11111", "10000", "10000", "11110", "10000", "10000", "11111"],
+    "F": ["11111", "10000", "10000", "11110", "10000", "10000", "10000"],
+    "G": ["01110", "10001", "10000", "10111", "10001", "10001", "01110"],
+    "H": ["10001", "10001", "10001", "11111", "10001", "10001", "10001"],
+    "I": ["01110", "00100", "00100", "00100", "00100", "00100", "01110"],
+    "K": ["10001", "10010", "10100", "11000", "10100", "10010", "10001"],
+    "L": ["10000", "10000", "10000", "10000", "10000", "10000", "11111"],
+    "M": ["10001", "11011", "10101", "10101", "10001", "10001", "10001"],
+    "N": ["10001", "10001", "11001", "10101", "10011", "10001", "10001"],
+    "O": ["01110", "10001", "10001", "10001", "10001", "10001", "01110"],
+    "P": ["11110", "10001", "10001", "11110", "10000", "10000", "10000"],
+    "R": ["11110", "10001", "10001", "11110", "10100", "10010", "10001"],
+    "S": ["01111", "10000", "10000", "01110", "00001", "00001", "11110"],
+    "T": ["11111", "00100", "00100", "00100", "00100", "00100", "00100"],
+    "U": ["10001", "10001", "10001", "10001", "10001", "10001", "01110"],
+    "Y": ["10001", "10001", "01010", "00100", "00100", "00100", "00100"],
+    "=": ["00000", "11111", "00000", "11111", "00000", "00000", "00000"],
+}
+
+
+def choose_portrait_cols(total_clusters, requested_cols):
+    if requested_cols is not None:
+        return requested_cols
+    # Keep width/height around 0.55 for a portrait-oriented map panel.
+    return max(32, int(math.sqrt(total_clusters * 0.55)))
+
+
+def fat_eoc_threshold(fat_type):
+    return 0xFFF8 if fat_type == "FAT16" else 0x0FFFFFF8
+
+
+def cluster_size_bytes(bpb):
+    return bpb["byts_per_sec"] * bpb["sec_per_clus"]
+
+
+def cluster_to_offset(part_offset, bpb, cluster_num):
+    first_sector = bpb["first_data_sector"] + (cluster_num - 2) * bpb["sec_per_clus"]
+    return part_offset + first_sector * bpb["byts_per_sec"]
+
+
+def read_cluster_bytes(f, part_offset, bpb, cluster_num):
+    return read_at(f, cluster_to_offset(part_offset, bpb, cluster_num), cluster_size_bytes(bpb))
+
+
+def next_cluster(fat_entries, fat_type, cluster_num):
+    if cluster_num <= 1 or cluster_num >= len(fat_entries):
+        return None
+    nxt = fat_entries[cluster_num]
+    if nxt == 0:
+        return None
+    if nxt >= fat_eoc_threshold(fat_type):
+        return None
+    return nxt
+
+
+def get_cluster_chain(fat_entries, fat_type, start_cluster, max_steps):
+    chain = []
+    seen = set()
+    cur = start_cluster
+
+    while cur is not None and len(chain) < max_steps:
+        if cur < 2 or cur in seen or cur >= len(fat_entries):
+            break
+        chain.append(cur)
+        seen.add(cur)
+        cur = next_cluster(fat_entries, fat_type, cur)
+    return chain
+
+
+def iter_directory_entries(raw_dir_bytes):
+    for off in range(0, len(raw_dir_bytes), 32):
+        ent = raw_dir_bytes[off : off + 32]
+        if len(ent) < 32:
+            break
+        first = ent[0]
+        if first == 0x00:
+            break
+        if first == 0xE5:
+            continue
+        attr = ent[11]
+        if attr == 0x0F:
+            continue
+        yield ent
+
+
+def entry_start_cluster(ent, fat_type):
+    lo = struct.unpack_from("<H", ent, 26)[0]
+    if fat_type == "FAT32":
+        hi = struct.unpack_from("<H", ent, 20)[0]
+        return (hi << 16) | lo
+    return lo
+
+
+def root_dir_bytes(f, part_offset, bpb):
+    if bpb["fat_type"] == "FAT16":
+        root_sector = bpb["first_fat_sector"] + bpb["num_fats"] * bpb["fatsz"]
+        root_off = part_offset + root_sector * bpb["byts_per_sec"]
+        root_len = bpb["root_dir_secs"] * bpb["byts_per_sec"]
+        return read_at(f, root_off, root_len)
+    return b""
+
+
+def directory_chain_bytes(f, part_offset, bpb, fat_entries, start_cluster):
+    chain = get_cluster_chain(
+        fat_entries,
+        bpb["fat_type"],
+        start_cluster,
+        bpb["count_of_clusters"] + 2,
+    )
+    chunks = [read_cluster_bytes(f, part_offset, bpb, clus) for clus in chain]
+    return b"".join(chunks)
+
+
+def find_partial_file_clusters(f, part_offset, bpb, fat_entries):
+    partial_clusters = set()
+    max_chain = bpb["count_of_clusters"] + 2
+    clus_bytes = cluster_size_bytes(bpb)
+    visited_dirs = set()
+
+    def walk_entries(raw_dir, is_root=False):
+        for ent in iter_directory_entries(raw_dir):
+            attr = ent[11]
+            is_dir = (attr & 0x10) != 0
+            is_volume = (attr & 0x08) != 0
+            if is_volume:
+                continue
+
+            start = entry_start_cluster(ent, bpb["fat_type"])
+            size = struct.unpack_from("<I", ent, 28)[0]
+            name0 = ent[0]
+
+            if is_dir:
+                if name0 == 0x2E:
+                    continue
+                if start < 2:
+                    continue
+                if start in visited_dirs:
+                    continue
+                visited_dirs.add(start)
+                subdir = directory_chain_bytes(f, part_offset, bpb, fat_entries, start)
+                if subdir:
+                    walk_entries(subdir)
+                continue
+
+            if start < 2 or size == 0:
+                continue
+
+            needed = (size + clus_bytes - 1) // clus_bytes
+            if needed <= 0 or (size % clus_bytes) == 0:
+                continue
+
+            chain = get_cluster_chain(fat_entries, bpb["fat_type"], start, max_chain)
+            if len(chain) >= needed:
+                partial_clusters.add(chain[needed - 1])
+
+    if bpb["fat_type"] == "FAT16":
+        walk_entries(root_dir_bytes(f, part_offset, bpb), is_root=True)
+    else:
+        # FAT32 root directory starts at cluster in BPB offset 44.
+        root_clus = struct.unpack_from("<I", read_at(f, part_offset, 512), 44)[0]
+        if root_clus >= 2:
+            visited_dirs.add(root_clus)
+            walk_entries(directory_chain_bytes(f, part_offset, bpb, fat_entries, root_clus), is_root=True)
+
+    return partial_clusters
+
+
+def render_cluster_map(clusters, cols, scale, stats, info):
     if cols <= 0:
         raise ValueError("cols must be > 0")
     if scale <= 0:
         raise ValueError("scale must be > 0")
 
     total = len(clusters)
+    cols = choose_portrait_cols(total, cols)
     rows = max(1, math.ceil(total / cols))
 
-    # A small frame around the map.
+    # Portrait layout with a detailed legend panel above the map.
     pad = 8
-    legend_h = 22
+    title_h = 14
+    legend_h = 54
     map_w = cols
     map_h = rows
 
     width = (pad * 2 + map_w) * scale
-    height = (pad * 2 + legend_h + map_h) * scale
+    height = (pad * 2 + title_h + legend_h + map_h) * scale
 
     # Palette tuned to resemble old disk check maps.
     palette = {
         "bg": (204, 204, 204),
         "free": (12, 150, 150),
         "used": (0, 225, 225),
+        "partial": (245, 210, 70),
         "bad": (220, 45, 35),
         "empty": (180, 180, 180),
         "frame": (40, 40, 40),
         "legend_free": (12, 150, 150),
         "legend_used": (0, 225, 225),
+        "legend_partial": (245, 210, 70),
         "legend_bad": (220, 45, 35),
+        "text": (20, 20, 20),
     }
 
     pixels = bytearray(width * height * 3)
@@ -227,12 +422,25 @@ def render_cluster_map(clusters, cols, scale):
                 i = row + xx * 3
                 pixels[i : i + 3] = bytes(rgb)
 
+    def draw_char(ch, x, y, px_scale, rgb):
+        glyph = FONT_5X7.get(ch, FONT_5X7[" "])
+        for gy, row_bits in enumerate(glyph):
+            for gx, bit in enumerate(row_bits):
+                if bit == "1":
+                    fill_rect(x + gx * px_scale, y + gy * px_scale, px_scale, px_scale, rgb)
+
+    def draw_text(text, x, y, px_scale, rgb):
+        cursor = x
+        for ch in text.upper():
+            draw_char(ch, cursor, y, px_scale, rgb)
+            cursor += 6 * px_scale
+
     # Background
     fill_rect(0, 0, width, height, palette["bg"])
 
     # Map frame and area.
     map_x = pad * scale
-    map_y = (pad + legend_h) * scale
+    map_y = (pad + title_h + legend_h) * scale
     area_w = map_w * scale
     area_h = map_h * scale
 
@@ -244,31 +452,48 @@ def render_cluster_map(clusters, cols, scale):
         r = idx // cols
         c = idx % cols
         color = palette["free"] if state == "free" else palette["used"]
+        if state == "partial":
+            color = palette["partial"]
         if state == "bad":
             color = palette["bad"]
         x = map_x + c * scale
         y = map_y + r * scale
         fill_rect(x, y, scale, scale, color)
 
-    # Tiny legend color bars (no text to keep this dependency-free).
-    legend_y = (pad + 4) * scale
-    box = 6 * scale
-    gap = 3 * scale
-    lx = map_x
-    fill_rect(lx, legend_y, box, box, palette["legend_free"])
-    fill_rect(lx + box + gap, legend_y, box, box, palette["legend_used"])
-    fill_rect(lx + 2 * (box + gap), legend_y, box, box, palette["legend_bad"])
+    text_scale = max(1, scale // 2)
+    title_y = (pad + 2) * scale
+    draw_text(f"DISK MAP {info['fat_type']}", map_x, title_y, text_scale, palette["text"])
 
-    # Thin border around legend boxes.
-    for k in range(3):
-        bx = lx + k * (box + gap)
-        by = legend_y
-        for x in range(bx, bx + box):
+    legend_y = (pad + title_h + 2) * scale
+    box = 7 * scale
+    line_h = 10 * text_scale
+
+    legend_rows = [
+        ("FREE", stats["free"], palette["legend_free"]),
+        ("USED", stats["used"], palette["legend_used"]),
+        ("PARTIAL", stats["partial"], palette["legend_partial"]),
+        ("BAD", stats["bad"], palette["legend_bad"]),
+    ]
+
+    total_safe = max(1, stats["total"])
+    for i, (name, count, color) in enumerate(legend_rows):
+        by = legend_y + i * (box + 2 * scale)
+        fill_rect(map_x, by, box, box, color)
+        for x in range(map_x, map_x + box):
             set_px(x, by, palette["frame"])
             set_px(x, by + box - 1, palette["frame"])
         for y in range(by, by + box):
-            set_px(bx, y, palette["frame"])
-            set_px(bx + box - 1, y, palette["frame"])
+            set_px(map_x, y, palette["frame"])
+            set_px(map_x + box - 1, y, palette["frame"])
+
+        pct = int((count * 100.0) / total_safe + 0.5)
+        line = f"{name}: {count} ({pct}%)"
+        draw_text(line, map_x + box + 3 * scale, by + scale, text_scale, palette["text"])
+
+    info_y = legend_y + 4 * (box + 2 * scale) + scale
+    draw_text(f"TOTAL: {stats['total']}", map_x, info_y, text_scale, palette["text"])
+    draw_text(f"PARTITION: {info['partition']}", map_x, info_y + line_h, text_scale, palette["text"])
+    draw_text(f"CLUSTERS/ROW: {cols}", map_x, info_y + line_h * 2, text_scale, palette["text"])
 
     return width, height, pixels
 
@@ -322,11 +547,16 @@ def main():
     ap.add_argument("--i", required=True, help="Input disk image path (.img)")
     ap.add_argument("--o", required=True, help="Output PNG path")
     ap.add_argument("--partition", type=int, default=None, help="MBR partition index 0..3 (default: first FAT)")
-    ap.add_argument("--cols", type=int, default=128, help="Clusters per row in output map")
+    ap.add_argument(
+        "--cols",
+        type=int,
+        default=None,
+        help="Clusters per row in output map (default: auto portrait)",
+    )
     ap.add_argument("--scale", type=int, default=4, help="Pixel size for each cluster cell")
     args = ap.parse_args()
 
-    if args.cols < 8:
+    if args.cols is not None and args.cols < 8:
         raise SystemExit("--cols must be >= 8")
     if args.scale < 1:
         raise SystemExit("--scale must be >= 1")
@@ -344,18 +574,46 @@ def main():
 
         part_off = part["start_lba"] * SECTOR_SIZE
         fat_entries = load_fat_entries(f, part_off, bpb)
+        partial_set = find_partial_file_clusters(f, part_off, bpb, fat_entries)
+
         clusters, free_count, used_count, bad_count = classify_clusters(
             fat_entries, bpb["fat_type"], bpb["count_of_clusters"]
         )
 
-    width, height, rgb = render_cluster_map(clusters, args.cols, args.scale)
+    partial_count = 0
+    for i, state in enumerate(clusters):
+        if state != "used":
+            continue
+        clus_num = i + 2
+        if clus_num in partial_set:
+            clusters[i] = "partial"
+            partial_count += 1
+
+    used_count = max(0, used_count - partial_count)
+
+    stats = {
+        "total": len(clusters),
+        "free": free_count,
+        "used": used_count,
+        "partial": partial_count,
+        "bad": bad_count,
+    }
+    info = {
+        "fat_type": bpb["fat_type"],
+        "partition": part["index"],
+    }
+
+    width, height, rgb = render_cluster_map(clusters, args.cols, args.scale, stats, info)
     write_png_rgb(out_path, width, height, rgb)
 
     total = len(clusters)
     print(f"Input image : {image_path}")
     print(f"FAT type    : {bpb['fat_type']}")
     print(f"Partition   : start LBA {part['start_lba']} (index {part['index']})")
-    print(f"Clusters    : total={total} free={free_count} used={used_count} bad={bad_count}")
+    print(
+        f"Clusters    : total={total} free={free_count} used={used_count} "
+        f"partial={partial_count} bad={bad_count}"
+    )
     print(f"Output PNG  : {out_path} ({width}x{height})")
 
 
