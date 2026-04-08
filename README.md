@@ -65,6 +65,31 @@ python disk_imaging/image_tool.py --help
 python disk_imaging/image_tool.py --source /dev/sda --output /path/to/my-disk-image.img
 ```
 
+### disk_map.py: Generate a FAT cluster map PNG
+
+Create a map with automatic size:
+
+```bash
+python disk_map.py --i path/to/disk.img --o map.png
+```
+
+Create a map with fixed output resolution:
+
+```bash
+python disk_map.py --i path/to/disk.img --o map_640x480.png --resolution=640x480
+```
+
+Use fixed resolution and explicit clusters per row:
+
+```bash
+python disk_map.py --i path/to/disk.img --o map_hd.png --resolution=1280x720 --cols=256
+```
+
+Notes:
+- `--resolution=WIDTHxHEIGHT` sets the exact PNG size.
+- When `--resolution` is used, map scale is auto-fitted so cluster blocks remain visible.
+- If `--cols` is also set, that column count is preserved and scale is adjusted to fit.
+
 ## Contributing 🤝 
 
 Contributions are what make the open-source community such an amazing place to learn, inspire, and create. Any contributions you make are greatly appreciated.

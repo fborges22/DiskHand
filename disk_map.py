@@ -231,6 +231,81 @@ def choose_portrait_cols(total_clusters, requested_cols):
     return max(32, int(math.sqrt(total_clusters * 0.55)))
 
 
+def parse_resolution(text):
+    raw = (text or "").strip().lower()
+    for sep in ("x", "*"):
+        if sep in raw:
+            left, right = raw.split(sep, 1)
+            try:
+                w = int(left.strip())
+                h = int(right.strip())
+            except ValueError as exc:
+                raise argparse.ArgumentTypeError(
+                    "resolution must be WIDTHxHEIGHT (for example: 640x480)"
+                ) from exc
+            if w < 64 or h < 64:
+                raise argparse.ArgumentTypeError("resolution must be at least 64x64")
+            return (w, h)
+    raise argparse.ArgumentTypeError(
+        "resolution must be WIDTHxHEIGHT (for example: 640x480)"
+    )
+
+
+def fit_layout_for_resolution(total_clusters, requested_cols, target_w, target_h):
+    if total_clusters <= 0:
+        raise ValueError("total_clusters must be > 0")
+
+    pad = 8
+    title_h = 14
+    legend_h = 54
+    h_units_fixed = 2 * pad + title_h + legend_h
+
+    def scale_for_cols(cols):
+        rows = max(1, math.ceil(total_clusters / cols))
+        w_units = 2 * pad + cols
+        h_units = h_units_fixed + rows
+        if w_units <= 0 or h_units <= 0:
+            return 0, rows
+        s = min(target_w // w_units, target_h // h_units)
+        return s, rows
+
+    if requested_cols is not None:
+        cols = requested_cols
+        scale, _rows = scale_for_cols(cols)
+        return cols, max(1, scale)
+
+    # Search for columns that produce the largest visible block size.
+    # Start near portrait estimate, but evaluate a broad bounded range.
+    start = max(8, min(total_clusters, choose_portrait_cols(total_clusters, None)))
+    lo = max(8, start // 3)
+    hi = min(total_clusters, max(start * 3, start + 1))
+
+    best_cols = start
+    best_scale, best_rows = scale_for_cols(start)
+
+    for cols in range(lo, hi + 1):
+        scale, rows = scale_for_cols(cols)
+        if scale > best_scale:
+            best_cols = cols
+            best_scale = scale
+            best_rows = rows
+            continue
+        if scale == best_scale:
+            # Break ties by choosing shape closest to target aspect ratio.
+            cur_w_units = 2 * pad + cols
+            cur_h_units = h_units_fixed + rows
+            best_w_units = 2 * pad + best_cols
+            best_h_units = h_units_fixed + best_rows
+            cur_err = abs(cur_w_units * target_h - cur_h_units * target_w)
+            best_err = abs(best_w_units * target_h - best_h_units * target_w)
+            if cur_err < best_err:
+                best_cols = cols
+                best_scale = scale
+                best_rows = rows
+
+    return best_cols, max(1, best_scale)
+
+
 def fat_eoc_threshold(fat_type):
     return 0xFFF8 if fat_type == "FAT16" else 0x0FFFFFF8
 
@@ -371,7 +446,7 @@ def find_partial_file_clusters(f, part_offset, bpb, fat_entries):
     return partial_clusters
 
 
-def render_cluster_map(clusters, cols, scale, stats, info):
+def render_cluster_map(clusters, cols, scale, stats, info, target_size=None):
     if cols <= 0:
         raise ValueError("cols must be > 0")
     if scale <= 0:
@@ -388,8 +463,17 @@ def render_cluster_map(clusters, cols, scale, stats, info):
     map_w = cols
     map_h = rows
 
-    width = (pad * 2 + map_w) * scale
-    height = (pad * 2 + title_h + legend_h + map_h) * scale
+    content_w = (pad * 2 + map_w) * scale
+    content_h = (pad * 2 + title_h + legend_h + map_h) * scale
+    if target_size is not None:
+        width, height = target_size
+        if width < content_w or height < content_h:
+            raise ValueError(
+                "target resolution is too small for the selected map layout; "
+                "increase resolution or reduce --cols"
+            )
+    else:
+        width, height = content_w, content_h
 
     # Palette tuned to resemble old disk check maps.
     palette = {
@@ -439,8 +523,11 @@ def render_cluster_map(clusters, cols, scale, stats, info):
     fill_rect(0, 0, width, height, palette["bg"])
 
     # Map frame and area.
-    map_x = pad * scale
-    map_y = (pad + title_h + legend_h) * scale
+    origin_x = (width - content_w) // 2
+    origin_y = (height - content_h) // 2
+
+    map_x = origin_x + pad * scale
+    map_y = origin_y + (pad + title_h + legend_h) * scale
     area_w = map_w * scale
     area_h = map_h * scale
 
@@ -461,10 +548,10 @@ def render_cluster_map(clusters, cols, scale, stats, info):
         fill_rect(x, y, scale, scale, color)
 
     text_scale = max(1, scale // 2)
-    title_y = (pad + 2) * scale
+    title_y = origin_y + (pad + 2) * scale
     draw_text(f"DISK MAP {info['fat_type']}", map_x, title_y, text_scale, palette["text"])
 
-    legend_y = (pad + title_h + 2) * scale
+    legend_y = origin_y + (pad + title_h + 2) * scale
     box = 7 * scale
     line_h = 10 * text_scale
 
@@ -554,6 +641,12 @@ def main():
         help="Clusters per row in output map (default: auto portrait)",
     )
     ap.add_argument("--scale", type=int, default=4, help="Pixel size for each cluster cell")
+    ap.add_argument(
+        "--resolution",
+        type=parse_resolution,
+        default=None,
+        help="Output PNG resolution WIDTHxHEIGHT, e.g. 640x480",
+    )
     args = ap.parse_args()
 
     if args.cols is not None and args.cols < 8:
@@ -603,7 +696,19 @@ def main():
         "partition": part["index"],
     }
 
-    width, height, rgb = render_cluster_map(clusters, args.cols, args.scale, stats, info)
+    cols = args.cols
+    scale = args.scale
+    if args.resolution is not None:
+        cols, scale = fit_layout_for_resolution(len(clusters), args.cols, args.resolution[0], args.resolution[1])
+
+    width, height, rgb = render_cluster_map(
+        clusters,
+        cols,
+        scale,
+        stats,
+        info,
+        target_size=args.resolution,
+    )
     write_png_rgb(out_path, width, height, rgb)
 
     total = len(clusters)
@@ -614,6 +719,7 @@ def main():
         f"Clusters    : total={total} free={free_count} used={used_count} "
         f"partial={partial_count} bad={bad_count}"
     )
+    print(f"Layout      : cols={cols} scale={scale}")
     print(f"Output PNG  : {out_path} ({width}x{height})")
 
 
