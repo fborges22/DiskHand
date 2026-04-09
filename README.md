@@ -104,6 +104,7 @@ Notes:
 - `--density=N` groups `N` clusters into one map cell (default: `1`) and changes block size/detail inside the fixed map panel.
 - `--preset=detail|balanced|overview` is a shortcut for density values `1`, `100`, and `1000`.
 - `--squareblocks` forces all map blocks to be perfect squares; to preserve square geometry, the drawn map can be slightly smaller than the panel.
+- For very large disks, density is auto-increased when needed so the map still fits the requested resolution.
 
 Density quick guide:
 - `--density=1`: highest detail, smallest blocks.

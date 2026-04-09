@@ -349,6 +349,39 @@ def choose_square_grid(cell_count, map_w, map_h):
     return best_cols, best_rows, best_px
 
 
+def layout_metrics(width, height):
+    pad = max(6, min(width, height) // 80)
+    title_h = max(12, height // 30)
+    legend_h = max(16, height // 22)
+    info_h = max(18, height // 18)
+    gap = max(2, height // 160)
+    top_h = title_h + legend_h + info_h + 3 * gap
+
+    map_panel_w = width - 2 * pad
+    map_panel_h = height - 2 * pad - top_h
+    return {
+        "pad": pad,
+        "title_h": title_h,
+        "legend_h": legend_h,
+        "info_h": info_h,
+        "gap": gap,
+        "top_h": top_h,
+        "map_panel_w": map_panel_w,
+        "map_panel_h": map_panel_h,
+    }
+
+
+def minimum_density_for_resolution(total_clusters, target_size):
+    width, height = target_size
+    m = layout_metrics(width, height)
+    if m["map_panel_w"] < 1 or m["map_panel_h"] < 1:
+        return None
+    capacity = m["map_panel_w"] * m["map_panel_h"]
+    if capacity < 1:
+        return None
+    return max(1, math.ceil(total_clusters / capacity))
+
+
 def fat_eoc_threshold(fat_type):
     return 0xFFF8 if fat_type == "FAT16" else 0x0FFFFFF8
 
@@ -545,15 +578,15 @@ def render_cluster_map(clusters, stats, info, target_size=None, square_blocks=Fa
     # Background
     fill_rect(0, 0, width, height, palette["bg"])
 
-    pad = max(6, min(width, height) // 80)
-    title_h = max(12, height // 30)
-    legend_h = max(16, height // 22)
-    info_h = max(18, height // 18)
-    gap = max(2, height // 160)
-    top_h = title_h + legend_h + info_h + 3 * gap
+    m = layout_metrics(width, height)
+    pad = m["pad"]
+    title_h = m["title_h"]
+    legend_h = m["legend_h"]
+    gap = m["gap"]
+    top_h = m["top_h"]
 
-    map_panel_w = width - 2 * pad
-    map_panel_h = height - 2 * pad - top_h
+    map_panel_w = m["map_panel_w"]
+    map_panel_h = m["map_panel_h"]
     if map_panel_w < 8 or map_panel_h < 8:
         raise ValueError("target resolution is too small for fixed map layout")
 
@@ -735,6 +768,8 @@ def main():
     if density < 1:
         raise SystemExit("--density must be >= 1")
 
+    target_size = args.resolution if args.resolution is not None else (640, 480)
+
     image_path = args.i
     out_path = args.o
 
@@ -764,6 +799,14 @@ def main():
             partial_count += 1
 
     used_count = max(0, used_count - partial_count)
+    min_density = minimum_density_for_resolution(len(clusters), target_size)
+    if min_density is None:
+        raise SystemExit("resolution is too small for map rendering")
+    auto_adjusted = False
+    if density < min_density:
+        density = min_density
+        auto_adjusted = True
+
     map_clusters = aggregate_clusters_for_density(clusters, density)
 
     stats = {
@@ -783,7 +826,7 @@ def main():
         map_clusters,
         stats,
         info,
-        target_size=args.resolution,
+        target_size=target_size,
         square_blocks=args.squareblocks,
     )
     write_png_rgb(out_path, width, height, rgb)
@@ -800,6 +843,11 @@ def main():
         f"Layout      : density={density} clusters/cell cells={len(map_clusters)} "
         f"squareblocks={'on' if args.squareblocks else 'off'}"
     )
+    if auto_adjusted:
+        print(
+            f"Note        : density auto-adjusted to {density} for resolution "
+            f"{target_size[0]}x{target_size[1]}"
+        )
     print(f"Output PNG  : {out_path} ({width}x{height})")
 
 
