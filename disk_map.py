@@ -752,6 +752,11 @@ def main():
         help="Force square map blocks (may slightly reduce used map area)",
     )
     ap.add_argument(
+        "--no-autodensity",
+        action="store_true",
+        help="Disable automatic density increase when map does not fit resolution",
+    )
+    ap.add_argument(
         "--resolution",
         type=parse_resolution,
         default=None,
@@ -804,6 +809,11 @@ def main():
         raise SystemExit("resolution is too small for map rendering")
     auto_adjusted = False
     if density < min_density:
+        if args.no_autodensity:
+            raise SystemExit(
+                f"density too low for {target_size[0]}x{target_size[1]} "
+                f"(minimum required: {min_density}); increase --density or remove --no-autodensity"
+            )
         density = min_density
         auto_adjusted = True
 
@@ -841,7 +851,8 @@ def main():
     )
     print(
         f"Layout      : density={density} clusters/cell cells={len(map_clusters)} "
-        f"squareblocks={'on' if args.squareblocks else 'off'}"
+        f"squareblocks={'on' if args.squareblocks else 'off'} "
+        f"autodensity={'off' if args.no_autodensity else 'on'}"
     )
     if auto_adjusted:
         print(

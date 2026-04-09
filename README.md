@@ -97,6 +97,12 @@ Force perfect square blocks:
 python disk_map.py --i path/to/disk.img --o map_square.png --resolution=640x480 --preset=balanced --squareblocks
 ```
 
+Disable automatic density adjustment (strict mode):
+
+```bash
+python disk_map.py --i path/to/disk.img --o map_strict.png --resolution=640x480 --density=1 --no-autodensity
+```
+
 Notes:
 - `--resolution=WIDTHxHEIGHT` sets the exact PNG size.
 - The legend and map panel positions are fixed for a given resolution.
@@ -105,6 +111,7 @@ Notes:
 - `--preset=detail|balanced|overview` is a shortcut for density values `1`, `100`, and `1000`.
 - `--squareblocks` forces all map blocks to be perfect squares; to preserve square geometry, the drawn map can be slightly smaller than the panel.
 - For very large disks, density is auto-increased when needed so the map still fits the requested resolution.
+- `--no-autodensity` disables this automatic increase and fails fast when the chosen density cannot fit.
 
 Density quick guide:
 - `--density=1`: highest detail, smallest blocks.
