@@ -79,16 +79,16 @@ Create a map with fixed output resolution:
 python disk_map.py --i path/to/disk.img --o map_640x480.png --resolution=640x480
 ```
 
-Use fixed resolution and explicit clusters per row:
+Use fixed resolution with denser map blocks (fewer cells):
 
 ```bash
-python disk_map.py --i path/to/disk.img --o map_hd.png --resolution=1280x720 --cols=256
+python disk_map.py --i path/to/disk.img --o map_hd.png --resolution=1280x720 --density=1000
 ```
 
 Notes:
 - `--resolution=WIDTHxHEIGHT` sets the exact PNG size.
-- When `--resolution` is used, map scale is auto-fitted so cluster blocks remain visible.
-- If `--cols` is also set, that column count is preserved and scale is adjusted to fit.
+- The legend and map panel positions are fixed for a given resolution.
+- `--density=N` groups `N` clusters into one map cell (default: `1`) and therefore changes block size/detail inside the fixed map panel.
 
 ## Contributing 🤝 
 

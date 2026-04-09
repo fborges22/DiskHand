@@ -224,13 +224,6 @@ FONT_5X7 = {
 }
 
 
-def choose_portrait_cols(total_clusters, requested_cols):
-    if requested_cols is not None:
-        return requested_cols
-    # Keep width/height around 0.55 for a portrait-oriented map panel.
-    return max(32, int(math.sqrt(total_clusters * 0.55)))
-
-
 def parse_resolution(text):
     raw = (text or "").strip().lower()
     for sep in ("x", "*"):
@@ -251,59 +244,56 @@ def parse_resolution(text):
     )
 
 
-def fit_layout_for_resolution(total_clusters, requested_cols, target_w, target_h):
-    if total_clusters <= 0:
-        raise ValueError("total_clusters must be > 0")
+def aggregate_clusters_for_density(clusters, density):
+    if density <= 1:
+        return list(clusters)
 
-    pad = 8
-    title_h = 14
-    legend_h = 54
-    h_units_fixed = 2 * pad + title_h + legend_h
+    grouped = []
+    for i in range(0, len(clusters), density):
+        chunk = clusters[i : i + density]
+        if "bad" in chunk:
+            grouped.append("bad")
+        elif "partial" in chunk:
+            grouped.append("partial")
+        elif "used" in chunk:
+            grouped.append("used")
+        else:
+            grouped.append("free")
+    return grouped
 
-    def scale_for_cols(cols):
-        rows = max(1, math.ceil(total_clusters / cols))
-        w_units = 2 * pad + cols
-        h_units = h_units_fixed + rows
-        if w_units <= 0 or h_units <= 0:
-            return 0, rows
-        s = min(target_w // w_units, target_h // h_units)
-        return s, rows
 
-    if requested_cols is not None:
-        cols = requested_cols
-        scale, _rows = scale_for_cols(cols)
-        return cols, max(1, scale)
+def choose_grid_for_fixed_map(cell_count, map_w, map_h):
+    if cell_count <= 0:
+        return 1, 1, 1
 
-    # Search for columns that produce the largest visible block size.
-    # Start near portrait estimate, but evaluate a broad bounded range.
-    start = max(8, min(total_clusters, choose_portrait_cols(total_clusters, None)))
-    lo = max(8, start // 3)
-    hi = min(total_clusters, max(start * 3, start + 1))
+    aspect = map_w / max(1, map_h)
+    start = max(1, int(math.sqrt(cell_count * aspect)))
+    lo = max(1, start // 2)
+    hi = min(cell_count, max(start * 2, start + 1))
 
     best_cols = start
-    best_scale, best_rows = scale_for_cols(start)
+    best_rows = max(1, math.ceil(cell_count / best_cols))
+    best_px = min(map_w // best_cols, map_h // best_rows)
+    best_err = abs(best_cols * map_h - best_rows * map_w)
 
     for cols in range(lo, hi + 1):
-        scale, rows = scale_for_cols(cols)
-        if scale > best_scale:
+        rows = max(1, math.ceil(cell_count / cols))
+        px = min(map_w // cols, map_h // rows)
+        if px > best_px:
             best_cols = cols
-            best_scale = scale
             best_rows = rows
+            best_px = px
+            best_err = abs(cols * map_h - rows * map_w)
             continue
-        if scale == best_scale:
-            # Break ties by choosing shape closest to target aspect ratio.
-            cur_w_units = 2 * pad + cols
-            cur_h_units = h_units_fixed + rows
-            best_w_units = 2 * pad + best_cols
-            best_h_units = h_units_fixed + best_rows
-            cur_err = abs(cur_w_units * target_h - cur_h_units * target_w)
-            best_err = abs(best_w_units * target_h - best_h_units * target_w)
-            if cur_err < best_err:
+        if px == best_px:
+            err = abs(cols * map_h - rows * map_w)
+            if err < best_err:
                 best_cols = cols
-                best_scale = scale
                 best_rows = rows
+                best_px = px
+                best_err = err
 
-    return best_cols, max(1, best_scale)
+    return best_cols, best_rows, max(0, best_px)
 
 
 def fat_eoc_threshold(fat_type):
@@ -446,34 +436,14 @@ def find_partial_file_clusters(f, part_offset, bpb, fat_entries):
     return partial_clusters
 
 
-def render_cluster_map(clusters, cols, scale, stats, info, target_size=None):
-    if cols <= 0:
-        raise ValueError("cols must be > 0")
-    if scale <= 0:
-        raise ValueError("scale must be > 0")
-
+def render_cluster_map(clusters, stats, info, target_size=None):
     total = len(clusters)
-    cols = choose_portrait_cols(total, cols)
-    rows = max(1, math.ceil(total / cols))
-
-    # Portrait layout with a detailed legend panel above the map.
-    pad = 8
-    title_h = 14
-    legend_h = 54
-    map_w = cols
-    map_h = rows
-
-    content_w = (pad * 2 + map_w) * scale
-    content_h = (pad * 2 + title_h + legend_h + map_h) * scale
     if target_size is not None:
         width, height = target_size
-        if width < content_w or height < content_h:
-            raise ValueError(
-                "target resolution is too small for the selected map layout; "
-                "increase resolution or reduce --cols"
-            )
     else:
-        width, height = content_w, content_h
+        width, height = (640, 480)
+    if width < 64 or height < 64:
+        raise ValueError("target resolution is too small")
 
     # Palette tuned to resemble old disk check maps.
     palette = {
@@ -522,19 +492,38 @@ def render_cluster_map(clusters, cols, scale, stats, info, target_size=None):
     # Background
     fill_rect(0, 0, width, height, palette["bg"])
 
-    # Map frame and area.
-    origin_x = (width - content_w) // 2
-    origin_y = (height - content_h) // 2
+    pad = max(6, min(width, height) // 80)
+    title_h = max(12, height // 30)
+    legend_h = max(16, height // 22)
+    info_h = max(18, height // 18)
+    gap = max(2, height // 160)
+    top_h = title_h + legend_h + info_h + 3 * gap
 
-    map_x = origin_x + pad * scale
-    map_y = origin_y + (pad + title_h + legend_h) * scale
-    area_w = map_w * scale
-    area_h = map_h * scale
+    map_panel_w = width - 2 * pad
+    map_panel_h = height - 2 * pad - top_h
+    if map_panel_w < 8 or map_panel_h < 8:
+        raise ValueError("target resolution is too small for fixed map layout")
 
-    fill_rect(map_x - scale, map_y - scale, area_w + 2 * scale, area_h + 2 * scale, palette["frame"])
+    cols, rows, cell_px = choose_grid_for_fixed_map(total, map_panel_w, map_panel_h)
+    if cell_px <= 0:
+        raise ValueError(
+            "density too low for this resolution; increase --density or resolution"
+        )
+
+    area_w = cols * cell_px
+    area_h = rows * cell_px
+    if area_h > map_panel_h:
+        raise ValueError(
+            "density too low for this resolution; increase --density or resolution"
+        )
+
+    map_x = pad + (map_panel_w - area_w) // 2
+    map_y = pad + top_h + (map_panel_h - area_h) // 2
+
+    fill_rect(map_x - 1, map_y - 1, area_w + 2, area_h + 2, palette["frame"])
     fill_rect(map_x, map_y, area_w, area_h, palette["empty"])
 
-    # Cluster cells (1 cluster = 1 square of `scale` pixels).
+    # Cluster cells are aggregated by density and drawn in a fixed map panel.
     for idx, state in enumerate(clusters):
         r = idx // cols
         c = idx % cols
@@ -543,16 +532,16 @@ def render_cluster_map(clusters, cols, scale, stats, info, target_size=None):
             color = palette["partial"]
         if state == "bad":
             color = palette["bad"]
-        x = map_x + c * scale
-        y = map_y + r * scale
-        fill_rect(x, y, scale, scale, color)
+        x = map_x + c * cell_px
+        y = map_y + r * cell_px
+        fill_rect(x, y, cell_px, cell_px, color)
 
-    text_scale = max(1, scale // 2)
-    title_y = origin_y + (pad + 2) * scale
-    draw_text(f"DISK MAP {info['fat_type']}", map_x, title_y, text_scale, palette["text"])
+    text_scale = max(1, min(2, height // 320))
+    title_y = pad + gap
+    draw_text(f"DISK MAP {info['fat_type']}", pad, title_y, text_scale, palette["text"])
 
-    legend_y = origin_y + (pad + title_h + 2) * scale
-    box = 7 * scale
+    legend_y = title_y + title_h
+    box = max(6, height // 48)
     line_h = 10 * text_scale
 
     legend_rows = [
@@ -563,24 +552,30 @@ def render_cluster_map(clusters, cols, scale, stats, info, target_size=None):
     ]
 
     total_safe = max(1, stats["total"])
+    slot_w = max(1, map_panel_w // len(legend_rows))
     for i, (name, count, color) in enumerate(legend_rows):
-        by = legend_y + i * (box + 2 * scale)
-        fill_rect(map_x, by, box, box, color)
-        for x in range(map_x, map_x + box):
-            set_px(x, by, palette["frame"])
-            set_px(x, by + box - 1, palette["frame"])
-        for y in range(by, by + box):
-            set_px(map_x, y, palette["frame"])
-            set_px(map_x + box - 1, y, palette["frame"])
+        lx = pad + i * slot_w
+        fill_rect(lx, legend_y, box, box, color)
+        for x in range(lx, lx + box):
+            set_px(x, legend_y, palette["frame"])
+            set_px(x, legend_y + box - 1, palette["frame"])
+        for y in range(legend_y, legend_y + box):
+            set_px(lx, y, palette["frame"])
+            set_px(lx + box - 1, y, palette["frame"])
 
         pct = int((count * 100.0) / total_safe + 0.5)
         line = f"{name}: {count} ({pct}%)"
-        draw_text(line, map_x + box + 3 * scale, by + scale, text_scale, palette["text"])
+        draw_text(line, lx + box + 2, legend_y + 1, text_scale, palette["text"])
 
-    info_y = legend_y + 4 * (box + 2 * scale) + scale
-    draw_text(f"TOTAL: {stats['total']}", map_x, info_y, text_scale, palette["text"])
-    draw_text(f"PARTITION: {info['partition']}", map_x, info_y + line_h, text_scale, palette["text"])
-    draw_text(f"CLUSTERS/ROW: {cols}", map_x, info_y + line_h * 2, text_scale, palette["text"])
+    info_y = legend_y + legend_h
+    draw_text(f"TOTAL: {stats['total']} PARTITION: {info['partition']}", pad, info_y, text_scale, palette["text"])
+    draw_text(
+        f"DENSITY: {info['density']} CLUS/CELL BLOCK: {cell_px}px LINE: {cols}",
+        pad,
+        info_y + line_h,
+        text_scale,
+        palette["text"],
+    )
 
     return width, height, pixels
 
@@ -634,13 +629,7 @@ def main():
     ap.add_argument("--i", required=True, help="Input disk image path (.img)")
     ap.add_argument("--o", required=True, help="Output PNG path")
     ap.add_argument("--partition", type=int, default=None, help="MBR partition index 0..3 (default: first FAT)")
-    ap.add_argument(
-        "--cols",
-        type=int,
-        default=None,
-        help="Clusters per row in output map (default: auto portrait)",
-    )
-    ap.add_argument("--scale", type=int, default=4, help="Pixel size for each cluster cell")
+    ap.add_argument("--density", type=int, default=1, help="Clusters represented by each map cell")
     ap.add_argument(
         "--resolution",
         type=parse_resolution,
@@ -649,10 +638,8 @@ def main():
     )
     args = ap.parse_args()
 
-    if args.cols is not None and args.cols < 8:
-        raise SystemExit("--cols must be >= 8")
-    if args.scale < 1:
-        raise SystemExit("--scale must be >= 1")
+    if args.density < 1:
+        raise SystemExit("--density must be >= 1")
 
     image_path = args.i
     out_path = args.o
@@ -683,6 +670,7 @@ def main():
             partial_count += 1
 
     used_count = max(0, used_count - partial_count)
+    map_clusters = aggregate_clusters_for_density(clusters, args.density)
 
     stats = {
         "total": len(clusters),
@@ -694,17 +682,11 @@ def main():
     info = {
         "fat_type": bpb["fat_type"],
         "partition": part["index"],
+        "density": args.density,
     }
 
-    cols = args.cols
-    scale = args.scale
-    if args.resolution is not None:
-        cols, scale = fit_layout_for_resolution(len(clusters), args.cols, args.resolution[0], args.resolution[1])
-
     width, height, rgb = render_cluster_map(
-        clusters,
-        cols,
-        scale,
+        map_clusters,
         stats,
         info,
         target_size=args.resolution,
@@ -719,7 +701,7 @@ def main():
         f"Clusters    : total={total} free={free_count} used={used_count} "
         f"partial={partial_count} bad={bad_count}"
     )
-    print(f"Layout      : cols={cols} scale={scale}")
+    print(f"Layout      : density={args.density} clusters/cell cells={len(map_clusters)}")
     print(f"Output PNG  : {out_path} ({width}x{height})")
 
 
