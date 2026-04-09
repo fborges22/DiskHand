@@ -17,6 +17,11 @@ import struct
 import zlib
 
 SECTOR_SIZE = 512
+PRESET_DENSITY = {
+    "detail": 1,
+    "balanced": 100,
+    "overview": 1000,
+}
 
 
 def read_at(f, offset, size):
@@ -266,18 +271,17 @@ def choose_grid_for_fixed_map(cell_count, map_w, map_h):
     if cell_count <= 0:
         return 1, 1, 1
 
-    aspect = map_w / max(1, map_h)
-    start = max(1, int(math.sqrt(cell_count * aspect)))
-    lo = max(1, start // 2)
-    hi = min(cell_count, max(start * 2, start + 1))
+    # Search all viable columns bounded by panel width so each cell stays visible.
+    hi = min(cell_count, map_w)
+    best_cols = 1
+    best_rows = cell_count
+    best_px = 0
+    best_err = 1 << 60
 
-    best_cols = start
-    best_rows = max(1, math.ceil(cell_count / best_cols))
-    best_px = min(map_w // best_cols, map_h // best_rows)
-    best_err = abs(best_cols * map_h - best_rows * map_w)
-
-    for cols in range(lo, hi + 1):
+    for cols in range(1, hi + 1):
         rows = max(1, math.ceil(cell_count / cols))
+        if rows > map_h:
+            continue
         px = min(map_w // cols, map_h // rows)
         if px > best_px:
             best_cols = cols
@@ -293,7 +297,56 @@ def choose_grid_for_fixed_map(cell_count, map_w, map_h):
                 best_px = px
                 best_err = err
 
+    if best_px <= 0:
+        return 0, 0, 0
     return best_cols, best_rows, max(0, best_px)
+
+
+def choose_square_grid(cell_count, map_w, map_h):
+    if cell_count <= 0:
+        return 1, 1, 1
+
+    hi = min(cell_count, map_w)
+    best_cols = 0
+    best_rows = 0
+    best_px = 0
+    best_area = -1
+    best_err = 1 << 60
+
+    for cols in range(1, hi + 1):
+        rows = max(1, math.ceil(cell_count / cols))
+        px = min(map_w // cols, map_h // rows)
+        if px <= 0:
+            continue
+        used_w = cols * px
+        used_h = rows * px
+        used_area = used_w * used_h
+        err = abs(cols * map_h - rows * map_w)
+
+        if px > best_px:
+            best_cols = cols
+            best_rows = rows
+            best_px = px
+            best_area = used_area
+            best_err = err
+            continue
+        if px == best_px and used_area > best_area:
+            best_cols = cols
+            best_rows = rows
+            best_px = px
+            best_area = used_area
+            best_err = err
+            continue
+        if px == best_px and used_area == best_area and err < best_err:
+            best_cols = cols
+            best_rows = rows
+            best_px = px
+            best_area = used_area
+            best_err = err
+
+    if best_px <= 0:
+        return 0, 0, 0
+    return best_cols, best_rows, best_px
 
 
 def fat_eoc_threshold(fat_type):
@@ -436,7 +489,7 @@ def find_partial_file_clusters(f, part_offset, bpb, fat_entries):
     return partial_clusters
 
 
-def render_cluster_map(clusters, stats, info, target_size=None):
+def render_cluster_map(clusters, stats, info, target_size=None, square_blocks=False):
     total = len(clusters)
     if target_size is not None:
         width, height = target_size
@@ -504,37 +557,60 @@ def render_cluster_map(clusters, stats, info, target_size=None):
     if map_panel_w < 8 or map_panel_h < 8:
         raise ValueError("target resolution is too small for fixed map layout")
 
-    cols, rows, cell_px = choose_grid_for_fixed_map(total, map_panel_w, map_panel_h)
-    if cell_px <= 0:
-        raise ValueError(
-            "density too low for this resolution; increase --density or resolution"
-        )
+    if square_blocks:
+        cols, rows, cell_px = choose_square_grid(total, map_panel_w, map_panel_h)
+        if cell_px <= 0:
+            raise ValueError(
+                "density too low for this resolution; increase --density or resolution"
+            )
 
-    area_w = cols * cell_px
-    area_h = rows * cell_px
-    if area_h > map_panel_h:
-        raise ValueError(
-            "density too low for this resolution; increase --density or resolution"
-        )
+        map_w = cols * cell_px
+        map_h = rows * cell_px
+        map_x = pad + (map_panel_w - map_w) // 2
+        map_y = pad + top_h + (map_panel_h - map_h) // 2
 
-    map_x = pad + (map_panel_w - area_w) // 2
-    map_y = pad + top_h + (map_panel_h - area_h) // 2
+        fill_rect(map_x - 1, map_y - 1, map_w + 2, map_h + 2, palette["frame"])
+        fill_rect(map_x, map_y, map_w, map_h, palette["empty"])
 
-    fill_rect(map_x - 1, map_y - 1, area_w + 2, area_h + 2, palette["frame"])
-    fill_rect(map_x, map_y, area_w, area_h, palette["empty"])
+        for idx, state in enumerate(clusters):
+            r = idx // cols
+            c = idx % cols
+            color = palette["free"] if state == "free" else palette["used"]
+            if state == "partial":
+                color = palette["partial"]
+            if state == "bad":
+                color = palette["bad"]
+            x = map_x + c * cell_px
+            y = map_y + r * cell_px
+            fill_rect(x, y, cell_px, cell_px, color)
+    else:
+        cols, rows, cell_px = choose_grid_for_fixed_map(total, map_panel_w, map_panel_h)
+        if cell_px <= 0:
+            raise ValueError(
+                "density too low for this resolution; increase --density or resolution"
+            )
 
-    # Cluster cells are aggregated by density and drawn in a fixed map panel.
-    for idx, state in enumerate(clusters):
-        r = idx // cols
-        c = idx % cols
-        color = palette["free"] if state == "free" else palette["used"]
-        if state == "partial":
-            color = palette["partial"]
-        if state == "bad":
-            color = palette["bad"]
-        x = map_x + c * cell_px
-        y = map_y + r * cell_px
-        fill_rect(x, y, cell_px, cell_px, color)
+        map_x = pad
+        map_y = pad + top_h
+
+        fill_rect(map_x - 1, map_y - 1, map_panel_w + 2, map_panel_h + 2, palette["frame"])
+        fill_rect(map_x, map_y, map_panel_w, map_panel_h, palette["empty"])
+
+        # Cluster cells are aggregated by density and drawn in a fixed map panel.
+        for idx, state in enumerate(clusters):
+            r = idx // cols
+            c = idx % cols
+            color = palette["free"] if state == "free" else palette["used"]
+            if state == "partial":
+                color = palette["partial"]
+            if state == "bad":
+                color = palette["bad"]
+            x0 = map_x + (c * map_panel_w) // cols
+            x1 = map_x + ((c + 1) * map_panel_w) // cols
+            y0 = map_y + (r * map_panel_h) // rows
+            y1 = map_y + ((r + 1) * map_panel_h) // rows
+            if x1 > x0 and y1 > y0:
+                fill_rect(x0, y0, x1 - x0, y1 - y0, color)
 
     text_scale = max(1, min(2, height // 320))
     title_y = pad + gap
@@ -570,7 +646,7 @@ def render_cluster_map(clusters, stats, info, target_size=None):
     info_y = legend_y + legend_h
     draw_text(f"TOTAL: {stats['total']} PARTITION: {info['partition']}", pad, info_y, text_scale, palette["text"])
     draw_text(
-        f"DENSITY: {info['density']} CLUS/CELL BLOCK: {cell_px}px LINE: {cols}",
+        f"DENSITY: {info['density']} CLUS/CELL BLOCK>= {cell_px}px LINE: {cols} SQ: {'ON' if square_blocks else 'OFF'}",
         pad,
         info_y + line_h,
         text_scale,
@@ -629,7 +705,19 @@ def main():
     ap.add_argument("--i", required=True, help="Input disk image path (.img)")
     ap.add_argument("--o", required=True, help="Output PNG path")
     ap.add_argument("--partition", type=int, default=None, help="MBR partition index 0..3 (default: first FAT)")
-    ap.add_argument("--density", type=int, default=1, help="Clusters represented by each map cell")
+    density_group = ap.add_mutually_exclusive_group()
+    density_group.add_argument("--density", type=int, default=None, help="Clusters represented by each map cell")
+    density_group.add_argument(
+        "--preset",
+        choices=sorted(PRESET_DENSITY.keys()),
+        default=None,
+        help="Density preset (detail, balanced, overview)",
+    )
+    ap.add_argument(
+        "--squareblocks",
+        action="store_true",
+        help="Force square map blocks (may slightly reduce used map area)",
+    )
     ap.add_argument(
         "--resolution",
         type=parse_resolution,
@@ -638,7 +726,13 @@ def main():
     )
     args = ap.parse_args()
 
-    if args.density < 1:
+    density = args.density
+    if density is None and args.preset is not None:
+        density = PRESET_DENSITY[args.preset]
+    if density is None:
+        density = 1
+
+    if density < 1:
         raise SystemExit("--density must be >= 1")
 
     image_path = args.i
@@ -670,7 +764,7 @@ def main():
             partial_count += 1
 
     used_count = max(0, used_count - partial_count)
-    map_clusters = aggregate_clusters_for_density(clusters, args.density)
+    map_clusters = aggregate_clusters_for_density(clusters, density)
 
     stats = {
         "total": len(clusters),
@@ -682,7 +776,7 @@ def main():
     info = {
         "fat_type": bpb["fat_type"],
         "partition": part["index"],
-        "density": args.density,
+        "density": density,
     }
 
     width, height, rgb = render_cluster_map(
@@ -690,6 +784,7 @@ def main():
         stats,
         info,
         target_size=args.resolution,
+        square_blocks=args.squareblocks,
     )
     write_png_rgb(out_path, width, height, rgb)
 
@@ -701,7 +796,10 @@ def main():
         f"Clusters    : total={total} free={free_count} used={used_count} "
         f"partial={partial_count} bad={bad_count}"
     )
-    print(f"Layout      : density={args.density} clusters/cell cells={len(map_clusters)}")
+    print(
+        f"Layout      : density={density} clusters/cell cells={len(map_clusters)} "
+        f"squareblocks={'on' if args.squareblocks else 'off'}"
+    )
     print(f"Output PNG  : {out_path} ({width}x{height})")
 
 

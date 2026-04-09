@@ -85,10 +85,31 @@ Use fixed resolution with denser map blocks (fewer cells):
 python disk_map.py --i path/to/disk.img --o map_hd.png --resolution=1280x720 --density=1000
 ```
 
+Use a density preset:
+
+```bash
+python disk_map.py --i path/to/disk.img --o map_balanced.png --resolution=640x480 --preset=balanced
+```
+
+Force perfect square blocks:
+
+```bash
+python disk_map.py --i path/to/disk.img --o map_square.png --resolution=640x480 --preset=balanced --squareblocks
+```
+
 Notes:
 - `--resolution=WIDTHxHEIGHT` sets the exact PNG size.
 - The legend and map panel positions are fixed for a given resolution.
-- `--density=N` groups `N` clusters into one map cell (default: `1`) and therefore changes block size/detail inside the fixed map panel.
+- The map always uses the maximum available panel area for the chosen resolution.
+- `--density=N` groups `N` clusters into one map cell (default: `1`) and changes block size/detail inside the fixed map panel.
+- `--preset=detail|balanced|overview` is a shortcut for density values `1`, `100`, and `1000`.
+- `--squareblocks` forces all map blocks to be perfect squares; to preserve square geometry, the drawn map can be slightly smaller than the panel.
+
+Density quick guide:
+- `--density=1`: highest detail, smallest blocks.
+- `--density=10`: very detailed, still fine-grained.
+- `--density=100`: balanced overview/detail.
+- `--density=1000`: coarse overview, large blocks.
 
 ## Contributing 🤝 
 
