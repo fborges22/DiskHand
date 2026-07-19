@@ -11,7 +11,7 @@ DiskHand is a comprehensive set of command-line tools and scripts designed for a
 - Partition Management: Easily create, resize, format, and delete partitions on both physical and virtual drives.
 - Disk Imaging & Cloning: Create precise, sector-by-sector copies of disks for backup, migration, or forensic analysis.
 - File System Tools: Analyze and repair various file systems including NTFS, ext4, and FAT32.
-- FAT Disk Checking and Defragmentation: Inspect FAT16/FAT32 disk images for allocation and directory issues, apply safe repairs, and defragment files in place.
+- FAT Disk Checking and Defragmentation: Inspect FAT16/FAT32 disk images for allocation and directory issues, apply safe repairs, defragment in place, or create a verified zero-hole rebuild.
 - Data Recovery: Tools to search for and recover deleted files and lost partitions.
 - Cross-Platform Support: Designed to work on various operating systems.
 
@@ -135,6 +135,7 @@ It can:
 - run integrity checks for lost clusters, cross-links, directory-chain issues, FAT copy mismatches, and FAT32 FSInfo inconsistencies
 - apply safe repairs for orphaned clusters and selected FAT metadata issues
 - defragment files in place or run denser full/perfect packing passes
+- create a fully packed clone that relocates both files and directories, verifies every file's contents, and requires zero internal allocation holes
 
 Examples:
 
@@ -174,12 +175,60 @@ Run in-place defragmentation:
 python diskmech.py path/to/disk.img -p 1 --inplace
 ```
 
+Run the strongest available in-place optimization:
+
+```bash
+python diskmech.py path/to/disk.img -p 1 --perfect --inplace
+```
+
+In-place optimization uses free clusters inside the existing image. It is
+best-effort and may leave internal holes when there is insufficient staging
+space or when directory placement prevents further safe moves.
+
+### Guaranteed zero-hole logical rebuild
+
+Use `--logical-rebuild-out` when the allocated cluster region must be fully
+packed. The output path must differ from the input path:
+
+```bash
+python diskmech.py path/to/disk.img -p 1 --logical-rebuild-out path/to/disk-defrag.img
+```
+
+This mode keeps the input image unchanged, clones it to the output path,
+relocates files and allocated directories, rebuilds all FAT copies, updates
+directory references (including `.` and `..`), and verifies:
+
+- FAT and directory integrity
+- zero fragmented files
+- zero internal allocation holes
+- file paths, sizes, and SHA-256 content hashes
+
+A successful run ends with:
+
+```text
+SUCCESS: zero internal holes and all file contents verified.
+```
+
+To safely replace an active image on PowerShell after verification:
+
+```powershell
+Copy-Item "D:\Images\disk.img" "D:\Images\disk-before-defrag.img"
+python .\diskmech.py "D:\Images\disk.img" -p 0 --logical-rebuild-out "D:\Images\disk-defragged.img"
+if ($LASTEXITCODE -ne 0) { throw "Defragmentation failed; the active image was not replaced." }
+Copy-Item "D:\Images\disk-defragged.img" "D:\Images\disk.img" -Force
+Remove-Item "D:\Images\disk-defragged.img"
+```
+
+Shut down any emulator or virtual machine using the image before modifying or
+replacing it.
+
 Notes:
 - `--repair` enables the repair workflow.
 - `--repair-autofix` applies all repairable actions without prompts.
 - `--repair-ask` asks before each repair action and requires an interactive terminal.
 - `--full` runs denser packing.
-- `--perfect` runs iterative full optimization passes to reduce internal holes as much as possible.
+- `--perfect` runs iterative, best-effort full optimization passes in place.
+- `--logical-rebuild-out` is the guaranteed zero-hole mode and requires a separate output path during the rebuild.
 - Back up the image before any write operation.
 
 ## Contributing 🤝 
