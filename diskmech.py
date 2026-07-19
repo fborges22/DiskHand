@@ -517,7 +517,13 @@ class FatVolume:
                 else:
                     base = e[0:8].decode("ascii", errors="replace").rstrip()
                     ext  = e[8:11].decode("ascii", errors="replace").rstrip()
-                    name = f"{base}.{ext}".rstrip(".")
+                    # Appending and then stripping a separator turns the special
+                    # names "." and ".." into an empty string. Preserve them so
+                    # callers can reliably exclude parent/self directory links.
+                    if base in (".", "..") and not ext:
+                        name = base
+                    else:
+                        name = f"{base}.{ext}" if ext else base
                 name = name.strip().strip("/\\")  # never carry trailing slashes
 
                 # Skip volume labels and dot entries
@@ -1592,12 +1598,13 @@ def select_repairs(planned: List[RepairAction], autofix: bool, ask_each: bool) -
 
 
 @dataclass
-class FileDataRecord:
-    """A file with its metadata and content for logical rebuild."""
-    entry: DirEntry
+class RebuildRecord:
+    """One allocated filesystem object participating in an offline rebuild."""
+    path: str
+    parent_path: str
+    entry: Optional[DirEntry]
     original_chain: List[int]
-    content: bytes
-    digest: str
+    new_chain: List[int] = field(default_factory=list)
 
 
 class LogicalRebuild:
@@ -1605,211 +1612,258 @@ class LogicalRebuild:
     Performs a complete logical rebuild to achieve zero-hole defragmentation.
     
     Strategy:
-    1. Read all files and directories from source volume
+    1. Enumerate all files and allocated directories from the source volume
     2. Create a new FAT with perfect linear allocation
     3. Rebuild directory structure pointing to new linear clusters
     4. Write new FAT and directory to destination
     5. Write all file data contiguously
     """
     
-    def __init__(self, src_vol: FatVolume, dst_f: io.BufferedRandom, verbose: bool=False):
+    def __init__(self, src_vol: FatVolume, dst_f: io.BufferedRandom, verbose: bool=False,
+                 show_progress: bool=True):
         self.src = src_vol
         self.dst_f = dst_f
         self.verbose = verbose
+        self.show_progress = show_progress
         self.cluster_size = src_vol.sec_per_clus * src_vol.byts_per_sec
-        self.files = []  # type: List[FileDataRecord]
+        self.records: List[RebuildRecord] = []
+        self.manifest: Dict[str, Tuple[bool, int, str]] = {}
+        self.cluster_relocation: Dict[int, int] = {}
         self.total_clusters_needed = 0
-    
-    def collect_all_files(self) -> None:
-        """Walk source filesystem and collect all files with their content."""
-        print("Collecting all files...")
-        visited = set()
-        
-        def walk_tree(start_cluster, is_root=False):
-            if not is_root and start_cluster in visited:
-                return
-            if not is_root:
-                visited.add(start_cluster)
-            
-            try:
-                entries = self.src.list_directory(start_cluster)
-            except Exception as e:
-                if self.verbose:
-                    print(f"  Skipping directory at cluster {start_cluster}: {e}")
-                return
-            
-            for entry in entries:
-                if entry.name in (".", ".."):
-                    continue
-                
-                try:
-                    if entry.is_dir:
-                        # Recursively walk subdirectories
-                        walk_tree(entry.start_cluster)
-                    else:
-                        # Read file content
-                        chain = self.src.cluster_chain(entry.start_cluster)
-                        content = b""
-                        for cluster in chain:
-                            content += self.src.cluster_read(cluster)
-                        # Trim to file size
-                        content = content[:entry.size]
-                        # Compute digest
-                        digest = hashlib.sha1(content).hexdigest()
-                        record = FileDataRecord(
-                            entry=entry,
-                            original_chain=chain,
-                            content=content,
-                            digest=digest
-                        )
-                        self.files.append(record)
-                        if self.verbose:
-                            print(f"  {entry.name}: {len(chain)} clusters, {len(content)} bytes")
-                except Exception as e:
-                    if self.verbose:
-                        print(f"  Skipping {entry.name}: {e}")
-        
-        # Walk root directory
+
+    @staticmethod
+    def _path_join(parent: str, name: str) -> str:
+        return "/" + name if parent == "/" else parent.rstrip("/") + "/" + name
+
+    def _file_digest(self, entry: DirEntry, chain: List[int]) -> str:
+        remaining = entry.size
+        digest = hashlib.sha256()
+        for cluster in chain:
+            data = self.src.cluster_read(cluster)
+            take = min(remaining, len(data))
+            digest.update(data[:take])
+            remaining -= take
+        if remaining:
+            raise ValueError(f"Truncated content while hashing {entry.name}")
+        return digest.hexdigest()
+
+    def collect_all_objects(self, announce: bool=True) -> None:
+        """Walk the complete tree and retain every allocated file and directory."""
+        if announce:
+            print("Collecting files and directories...")
+        self.records.clear()
+        self.manifest.clear()
+        validator = Defragmenter(self.src, verbose=False, full=True)
+
         if self.src.bpb.fat_type == "FAT32":
-            root_cluster = self.src.bpb.root_clus
-            walk_tree(root_cluster)
+            root_chain = self.src.cluster_chain(self.src.bpb.root_clus)
+            self.records.append(RebuildRecord("/", "", None, root_chain))
+            queue: List[Tuple[int, str]] = [(self.src.bpb.root_clus, "/")]
+            seen_dirs = {self.src.bpb.root_clus}
         else:
-            walk_tree(None, is_root=True)
-        
-        print(f"Collected {len(self.files)} files")
-    
+            queue = [(0, "/")]
+            seen_dirs: Set[int] = set()
+
+        while queue:
+            start, parent_path = queue.pop(0)
+            entries = self.src.list_directory(None if start < 2 else start)
+            for entry in entries:
+                path = self._path_join(parent_path, entry.name)
+                if entry.is_dir:
+                    if entry.start_cluster < 2:
+                        raise ValueError(f"Directory {path} has no valid start cluster")
+                    chain = self.src.cluster_chain(entry.start_cluster)
+                    self.records.append(RebuildRecord(path, parent_path, entry, chain))
+                    self.manifest[path] = (True, 0, "")
+                    if entry.start_cluster in seen_dirs:
+                        raise ValueError(f"Directory loop or duplicate directory cluster at {path}")
+                    seen_dirs.add(entry.start_cluster)
+                    queue.append((entry.start_cluster, path))
+                elif entry.size:
+                    chain = validator._validated_file_chain(entry)
+                    digest = self._file_digest(entry, chain)
+                    self.records.append(RebuildRecord(path, parent_path, entry, chain))
+                    self.manifest[path] = (False, entry.size, digest)
+                else:
+                    # Empty files have no allocation but still belong in semantic verification.
+                    if entry.start_cluster >= 2:
+                        raise ValueError(f"Empty file {path} unexpectedly owns cluster {entry.start_cluster}")
+                    self.manifest[path] = (False, 0, hashlib.sha256(b"").hexdigest())
+
+        if announce:
+            files = sum(1 for r in self.records if r.entry is not None and not r.entry.is_dir)
+            dirs = sum(1 for r in self.records if r.entry is None or r.entry.is_dir)
+            print(f"Collected {files} allocated files and {dirs} allocated directories")
+
     def allocate_new_layout(self) -> None:
-        """Compute new linear cluster allocation for all files."""
+        """Assign every allocated object a contiguous chain starting at cluster 2."""
         print("Computing linear allocation...")
+        self.records.sort(key=lambda record: record.original_chain[0])
         current_cluster = 2
-        for record in self.files:
-            required = (record.entry.size + self.cluster_size - 1) // self.cluster_size
-            record.entry.start_cluster = current_cluster
-            current_cluster += required
-        
+        self.cluster_relocation.clear()
+        for record in self.records:
+            length = len(record.original_chain)
+            record.new_chain = list(range(current_cluster, current_cluster + length))
+            for old, new in zip(record.original_chain, record.new_chain):
+                if old in self.cluster_relocation:
+                    raise ValueError(f"Cross-linked source cluster {old}")
+                self.cluster_relocation[old] = new
+            current_cluster += length
+
         self.total_clusters_needed = current_cluster - 2
-        if current_cluster > self.src.max_cluster:
+        if current_cluster - 1 > self.src.max_cluster:
             raise ValueError(
                 f"Not enough clusters: need {self.total_clusters_needed}, "
-                f"have {self.src.max_cluster - 2}"
+                f"have {self.src.max_cluster - 1}"
             )
-        print(f"Linear layout: {len(self.files)} files using {self.total_clusters_needed} clusters")
-    
-    def write_logical_rebuild(self) -> int:
-        """
-        Write the logically rebuilt disk to destination.
-        Returns number of files written.
-        """
-        # Copy boot sector and reserved sectors
-        boot = read_at(self.src.f, self.src.part.lba_start * 512, 512)
-        write_at(self.dst_f, self.src.part.lba_start * 512, boot)
-        
-        # Build new FAT
-        new_fat = [self.src.free_value for _ in range(self.src.max_cluster)]
-        new_fat[0] = 0xFF8 if self.src.fat_bits == 16 else 0xFFFFFFF8
-        new_fat[1] = self.src.free_value
-        
-        current_cluster = 2
-        for record in self.files:
-            required = (record.entry.size + self.cluster_size - 1) // self.cluster_size
-            # Build chain for this file
-            for i in range(required):
-                if i == required - 1:
-                    # Last cluster in chain
-                    new_fat[current_cluster + i] = self.src.eoc
-                else:
-                    # Link to next cluster
-                    new_fat[current_cluster + i] = current_cluster + i + 1
-            current_cluster += required
-        
-        # Write FAT(s)
-        fat_bytes = self._encode_fat(new_fat)
-        fat_sector = self.src.first_fat_sector
-        fat_size_sectors = self.src.fatsz
-        for fat_num in range(self.src.bpb.num_fats):
-            write_at(
-                self.dst_f,
-                (fat_sector + fat_num * fat_size_sectors) * self.src.byts_per_sec,
-                fat_bytes
-            )
-        
-        # Copy root directory structure from source
-        # (preserving directory hierarchy; actual directory entries will be updated by entries)
-        if self.src.bpb.fat_type == "FAT16":
-            root_dir_bytes = self.src.root_dir_sectors * self.src.byts_per_sec
-            root_dir_data = read_at(self.src.f, self.src.root_dir_first_sector * self.src.byts_per_sec, root_dir_bytes)
-            write_at(self.dst_f, self.src.root_dir_first_sector * self.src.byts_per_sec, root_dir_data)
-        
-        # Write file data contiguously
-        current_cluster = 2
-        prog = Progress(len(self.files), "Writing files")
-        for i, record in enumerate(self.files):
-            required = (record.entry.size + self.cluster_size - 1) // self.cluster_size
-            # Write file data starting at current_cluster
-            offset = 0
-            for j in range(required):
-                cluster_num = current_cluster + j
-                chunk = record.content[offset:offset + self.cluster_size]
-                if len(chunk) < self.cluster_size:
-                    # Pad last cluster
-                    chunk += b"\x00" * (self.cluster_size - len(chunk))
-                cluster_data = chunk[:self.cluster_size]
-                self.dst_f.seek(self.src.cluster_offset_bytes(cluster_num))
-                self.dst_f.write(cluster_data)
-                offset += len(cluster_data)
-            current_cluster += required
-            prog.update(1)
-        
-        return len(self.files)
-    
+        print(f"Linear layout: {len(self.records)} objects using {self.total_clusters_needed} clusters")
+
     def _encode_fat(self, fat: List[int]) -> bytes:
-        """Encode FAT list to bytes."""
         data = bytearray(self.src.fatsz * self.src.byts_per_sec)
-        for i, entry in enumerate(fat):
-            if i < len(data) // (2 if self.src.fat_bits == 16 else 4):
-                if self.src.fat_bits == 16:
-                    struct.pack_into("<H", data, i * 2, entry & 0xFFFF)
-                else:
-                    struct.pack_into("<I", data, i * 4, entry & 0x0FFFFFFF)
+        width = 2 if self.src.fat_bits == 16 else 4
+        count = min(len(fat), len(data) // width)
+        for i in range(count):
+            if width == 2:
+                struct.pack_into("<H", data, i * width, fat[i] & 0xFFFF)
+            else:
+                struct.pack_into("<I", data, i * width, fat[i] & 0x0FFFFFFF)
         return bytes(data)
+
+    def _translated_entry_offset(self, source_offset: int) -> int:
+        data_start = self.src.cluster_offset_bytes(2)
+        if source_offset < data_start:
+            # FAT16's fixed root directory remains outside the cluster heap.
+            return source_offset
+        relative = source_offset - data_start
+        old_cluster = 2 + relative // self.cluster_size
+        within_cluster = relative % self.cluster_size
+        if old_cluster not in self.cluster_relocation:
+            raise ValueError(f"Directory entry lies in unmapped cluster {old_cluster}")
+        return self.src.cluster_offset_bytes(self.cluster_relocation[old_cluster]) + within_cluster
+
+    def _patch_start_cluster(self, offset: int, new_start: int) -> None:
+        raw = bytearray(read_at(self.dst_f, offset, 32))
+        struct.pack_into("<H", raw, 26, new_start & 0xFFFF)
+        if self.src.bpb.fat_type == "FAT32":
+            struct.pack_into("<H", raw, 20, (new_start >> 16) & 0xFFFF)
+        write_at(self.dst_f, offset, bytes(raw))
+
+    def _patch_dot_entries(self, record: RebuildRecord, by_path: Dict[str, RebuildRecord]) -> None:
+        if record.path == "/":
+            return
+        first_offset = self.src.cluster_offset_bytes(record.new_chain[0])
+        first_two = read_at(self.dst_f, first_offset, 64)
+        if first_two[0:11] != b".          " or first_two[32:43] != b"..         ":
+            raise ValueError(f"Directory {record.path} has invalid '.' or '..' entries")
+        self._patch_start_cluster(first_offset, record.new_chain[0])
+        if record.parent_path == "/" and self.src.bpb.fat_type == "FAT16":
+            parent_start = 0
+        else:
+            parent = by_path.get(record.parent_path)
+            if parent is None:
+                raise ValueError(f"Missing rebuilt parent for {record.path}")
+            parent_start = parent.new_chain[0]
+        self._patch_start_cluster(first_offset + 32, parent_start)
+
+    def _patch_fat32_root_cluster(self, root_cluster: int) -> None:
+        if self.src.bpb.fat_type != "FAT32":
+            return
+        boot_sectors = [0]
+        if self.src.bpb.bkbootsec:
+            boot_sectors.append(self.src.bpb.bkbootsec)
+        for relative_sector in boot_sectors:
+            offset = (self.src.part.lba_start + relative_sector) * self.src.byts_per_sec
+            boot = bytearray(read_at(self.dst_f, offset, self.src.byts_per_sec))
+            struct.pack_into("<I", boot, 44, root_cluster)
+            write_at(self.dst_f, offset, bytes(boot))
+
+    def write_logical_rebuild(self) -> int:
+        """Write data, directory references, and a new zero-hole FAT to the clone."""
+        if not self.records or not self.cluster_relocation:
+            raise ValueError("Logical rebuild must be collected and allocated before writing")
+
+        new_fat = [self.src.free_value] * len(self.src.fat)
+        new_fat[0] = self.src.fat[0]
+        new_fat[1] = self.src.fat[1]
+        for record in self.records:
+            for i, cluster in enumerate(record.new_chain):
+                new_fat[cluster] = self.src.eoc if i == len(record.new_chain) - 1 else cluster + 1
+
+        # Source and destination are distinct handles, so cluster copies cannot overlap.
+        prog = Progress(self.total_clusters_needed, "Writing clusters") if self.show_progress else None
+        for record in self.records:
+            for old, new in zip(record.original_chain, record.new_chain):
+                write_at(self.dst_f, self.src.cluster_offset_bytes(new), self.src.cluster_read(old))
+                if prog:
+                    prog.update(1)
+        if prog:
+            prog.close()
+
+        fat_bytes = self._encode_fat(new_fat)
+        for fat_num in range(self.src.bpb.num_fats):
+            offset = (self.src.first_fat_sector + fat_num * self.src.fatsz) * self.src.byts_per_sec
+            write_at(self.dst_f, offset, fat_bytes)
+
+        by_path = {record.path: record for record in self.records}
+        for record in self.records:
+            if record.entry is not None:
+                self._patch_start_cluster(
+                    self._translated_entry_offset(record.entry.raw_offset), record.new_chain[0]
+                )
+            if record.entry is None or record.entry.is_dir:
+                self._patch_dot_entries(record, by_path)
+
+        if self.src.bpb.fat_type == "FAT32":
+            self._patch_fat32_root_cluster(by_path["/"].new_chain[0])
+
+        self.dst_f.flush()
+        os.fsync(self.dst_f.fileno())
+        return len(self.records)
 
 
 def run_logical_rebuild(src_img: str, dst_img: str, partition: Part, verbose: bool=False, show_progress: bool=True) -> int:
     """
     Perform a complete logical rebuild on a cloned image.
 
-    Strategy: clone the source image, run aggressive compaction cycles on the
-    clone, and return the final internal-hole count.
+    The source is cloned first. All referenced cluster chains are then rewritten
+    linearly in the clone; the source image is never modified.
     """
     print(f"Starting logical rebuild from {src_img} to {dst_img}...")
     make_backup(src_img, dst_img)
     
-    with open_image_rw(dst_img) as f:
-        vol = FatVolume.open(f, partition)
-        
-        holes_before, high_before = internal_holes(vol)
+    with open(src_img, "rb", buffering=0) as src_f, open_image_rw(dst_img) as dst_f:
+        src_vol = FatVolume.open(src_f, partition)
+        holes_before, high_before = internal_holes(src_vol)
         print(f"Clone holes: {holes_before} (within clusters 2..{high_before})")
-        
-        # Run aggressive perfect rebuild with many cycles to push toward zero holes
-        print("Running aggressive optimization passes to eliminate remaining holes...")
-        total_moves, total_bytes = run_perfect_rebuild_cycles(
-            vol=vol,
-            verbose=verbose,
-            show_progress=show_progress,
-            max_passes=64,  # More aggressive than default
-            max_cycles=16,  # More rebuild cycles
-            max_dir_moves=1024,  # Try harder with directory moves
-        )
-        
-        holes_after, high_after = internal_holes(vol)
-        print(f"After optimization: {holes_after} holes (within clusters 2..{high_after})")
-        
-        if holes_after == 0:
-            print("✓ SUCCESS: Logical rebuild achieved zero internal holes!")
-        else:
-            print(f"Note: {holes_after} holes remain (architectural limit of in-place optimization)")
-            print("Consider using full data rewrite if zero holes are essential.")
-        
+        rebuild = LogicalRebuild(src_vol, dst_f, verbose=verbose, show_progress=show_progress)
+        rebuild.collect_all_objects()
+        source_manifest = dict(rebuild.manifest)
+        rebuild.allocate_new_layout()
+        rebuild.write_logical_rebuild()
+
+    with open_image_rw(dst_img) as dst_f:
+        dst_vol = FatVolume.open(dst_f, partition)
+        holes_after, high_after = internal_holes(dst_vol)
+        print(f"After rebuild: {holes_after} holes (within clusters 2..{high_after})")
+        checker = IntegrityChecker(dst_vol, strict=True, verbose=verbose)
+        if not checker.run():
+            raise IOError("Rebuilt filesystem failed integrity verification")
+        verifier = LogicalRebuild(dst_vol, dst_f, verbose=False, show_progress=False)
+        verifier.collect_all_objects(announce=False)
+        if verifier.manifest != source_manifest:
+            missing = sorted(set(source_manifest) - set(verifier.manifest))
+            extra = sorted(set(verifier.manifest) - set(source_manifest))
+            changed = sorted(
+                path for path in set(source_manifest) & set(verifier.manifest)
+                if source_manifest[path] != verifier.manifest[path]
+            )
+            raise IOError(
+                f"Rebuilt filesystem content mismatch (missing={missing[:5]}, "
+                f"extra={extra[:5]}, changed={changed[:5]})"
+            )
+        if holes_after != 0:
+            raise IOError(f"Logical rebuild left {holes_after} internal allocation holes")
+        print("SUCCESS: zero internal holes and all file contents verified.")
         return holes_after
 
 
@@ -1924,7 +1978,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 1
         
         # Open source for integrity check
-        with open_image_rw(args.image) as src_f:
+        with open(args.image, "rb", buffering=0) as src_f:
             src_vol = FatVolume.open(src_f, target_part)
             
             # Run integrity check on source
